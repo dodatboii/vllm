@@ -515,14 +515,20 @@ class MPClient(EngineCoreClient):
             dp_size = parallel_config.data_parallel_size
             dp_rank = parallel_config.data_parallel_index
             dp_local_size = parallel_config.data_parallel_size_local
+
+            engine_count = dp_size
+            engine_rank = dp_rank
+            local_engine_count = dp_local_size
+
             offline_mode = parallel_config.data_parallel_rank_local is not None
             # Client manages local+remote EngineCores in pure internal LB case.
             # Client manages local EngineCores in hybrid and external LB case.
-            num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
+            num_ranks = local_engine_count if parallel_config.local_engines_only else engine_count
             self.engine_ranks_managed = (
-                [dp_rank] if offline_mode else list(range(dp_rank, dp_rank + num_ranks))
+                [engine_rank] if offline_mode else list(range(engine_rank, engine_rank + num_ranks))
             )
-            assert parallel_config.data_parallel_size_local <= len(
+
+            assert local_engine_count <= len(
                 self.engine_ranks_managed
             )
 
@@ -1226,8 +1232,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     ):
         self.client_count = client_count
 
+        # CP-aware routing configuration.
+        self.long_request_threshold = (
+            vllm_config.scheduler_config.long_request_threshold
+        )
+        self.cp_world_size = vllm_config.parallel_config.dycp_size
+
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
+        # Track CP request IDs so aborts can be broadcast to all engines.
+        self.cp_request_ids: set[str] = set()
 
         super().__init__(
             vllm_config,
@@ -1238,7 +1252,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             client_index,
         )
 
-        assert len(self.core_engines) > 1
+        if vllm_config.parallel_config.dycp_size == 1:
+            assert len(self.core_engines) > 1
 
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
@@ -1270,6 +1285,51 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.reqs_in_flight[request.request_id] = chosen_engine
         return chosen_engine
 
+    def _is_cp_request(self, request: EngineCoreRequest) -> bool:
+        """Check if request should be treated as a CP (long) request."""
+        if self.cp_world_size <= 1:
+            return False
+        if request.prompt_token_ids is None:
+            return False
+        return len(request.prompt_token_ids) >= self.long_request_threshold
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        """Override to broadcast CP requests to all engines."""
+        self._ensure_stats_update_task()
+
+        request.current_wave = self.current_wave
+        request.client_index = self.client_index
+
+        if self._is_cp_request(request):
+            # CP request: broadcast to ALL engines.
+            awaitables = []
+            for engine in self.core_engines:
+                awaitables.append(
+                    self._send_input(EngineCoreRequestType.ADD, request, engine)
+                )
+            # Track as CP request for abort routing.
+            self.reqs_in_flight[request.request_id] = self.core_engines[0]
+            self.cp_request_ids.add(request.request_id)
+            if not self.engines_running:
+                req_msg = msgspec.msgpack.encode(
+                    ("FIRST_REQ", self.core_engines[0])
+                )
+                await self.first_req_send_socket.send(req_msg)
+            for aw in awaitables:
+                await aw
+        else:
+            # Short request: route to least-loaded engine (existing behavior).
+            chosen_engine = self.get_core_engine_for_request(request)
+            to_await = self._send_input(
+                EngineCoreRequestType.ADD, request, chosen_engine
+            )
+            if not self.engines_running:
+                req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
+                await self.first_req_send_socket.send(req_msg)
+            await to_await
+
+        self._ensure_output_queue_task()
+
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
         return (
@@ -1288,21 +1348,33 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
+                self.cp_request_ids.discard(req_id)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if not request_ids or self.resources.engine_dead:
             return
 
         if len(request_ids) == 1:
-            # Fast-path common case.
-            if engine := self.reqs_in_flight.get(request_ids[0]):
-                await self._abort_requests(request_ids, engine)
+            req_id = request_ids[0]
+            if engine := self.reqs_in_flight.get(req_id):
+                if req_id in self.cp_request_ids:
+                    for eng in self.core_engines:
+                        await self._abort_requests([req_id], eng)
+                else:
+                    await self._abort_requests(request_ids, engine)
             return
 
         by_engine = defaultdict[EngineIdentity, list[str]](list)
+        cp_ids: list[str] = []
         for req_id in request_ids:
             if engine := self.reqs_in_flight.get(req_id):
-                by_engine[engine].append(req_id)
+                if req_id in self.cp_request_ids:
+                    cp_ids.append(req_id)
+                else:
+                    by_engine[engine].append(req_id)
+        if cp_ids:
+            for eng in self.core_engines:
+                await self._abort_requests(cp_ids, eng)
         for engine, req_ids in by_engine.items():
             await self._abort_requests(req_ids, engine)
 

@@ -1414,6 +1414,9 @@ class DPEngineCoreProc(EngineCoreProc):
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
+            # 1.5) CP sync: batch-synchronize pending CP requests across DPs.
+            self._maybe_run_cp_sync()
+
             # 2) Step the engine core.
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
@@ -1452,6 +1455,17 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Increment wave count and reset step counter.
                 self.current_wave += 1
                 self.step_counter = 0
+
+    def _maybe_run_cp_sync(self) -> None:
+        """Run CP sync protocol if scheduler supports it and has pending CPs."""
+        scheduler = self.scheduler
+        if (
+            hasattr(scheduler, "cp_sync")
+            and scheduler.cp_sync is not None
+            and scheduler.has_pending_cp_requests()
+            and scheduler.cp_sync.should_sync()
+        ):
+            scheduler.run_cp_sync()
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Optimization - only perform finish-sync all-reduce every 32 steps.
