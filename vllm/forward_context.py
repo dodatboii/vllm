@@ -55,6 +55,10 @@ class BatchDescriptor(NamedTuple):
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
+    num_dycp_reqs: int = 0
+    """
+    For dycp_reqs in the batch.
+    """
 
     def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """
@@ -67,6 +71,7 @@ class BatchDescriptor(NamedTuple):
             uniform=False,
             has_lora=self.has_lora,
             num_active_loras=self.num_active_loras,
+            num_dycp_reqs=self.num_dycp_reqs,
         )
 
 
