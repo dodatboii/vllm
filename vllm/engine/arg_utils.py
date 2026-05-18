@@ -592,6 +592,12 @@ class EngineArgs:
         "weight_transfer_config",
     )
 
+    # DYCP context config
+    dycp_size: int = ParallelConfig.dycp_size
+    # num_cp_seqs: number of requests to be processed in a single iteration for cp.
+    num_cp_seqs: int = SchedulerConfig.num_cp_seqs
+    long_request_threshold: int = SchedulerConfig.long_request_threshold
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -915,6 +921,13 @@ class EngineArgs:
             "--worker-extension-cls", **parallel_kwargs["worker_extension_cls"]
         )
 
+        # dycp_size: DYCP context parallel world size
+        parallel_group.add_argument(
+            "--dycp-size",
+            "-dycp",
+            **parallel_kwargs["dycp_size"]
+        )
+
         # KV cache arguments
         cache_kwargs = get_kwargs(CacheConfig)
         cache_group = parser.add_argument_group(
@@ -1154,6 +1167,15 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
+        )
+
+        scheduler_group.add_argument(
+            "--num-cp-seqs", **scheduler_kwargs["num_cp_seqs"]
+        )
+
+        scheduler_group.add_argument(
+            "--long-request-threshold",
+            **scheduler_kwargs["long_request_threshold"]
         )
 
         # Compilation arguments
@@ -1653,6 +1675,8 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            # domain parallel config
+            dycp_size=self.dycp_size,
         )
 
         speculative_config = self.create_speculative_config(
@@ -1677,6 +1701,8 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            num_cp_seqs=self.num_cp_seqs,
+            long_request_threshold=self.long_request_threshold,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
@@ -2051,6 +2077,7 @@ class EngineArgs:
                 usage_context.value if usage_context else None,
             )
 
+        self.max_num_batched_tokens = self.max_num_batched_tokens * self.dycp_size
         if orig_max_num_seqs is None:
             assert self.max_num_batched_tokens is not None  # For type checking
             self.max_num_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)

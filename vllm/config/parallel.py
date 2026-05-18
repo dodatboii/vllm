@@ -285,6 +285,9 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    dycp_size: int = Field(default=1, ge=1)
+    """Number of DP ranks per CP group (DYCP context parallel world size)."""
+
     _api_process_rank: int = Field(default=0, ge=-1)
     """
     The rank of this API process, or `-1` for engine core processes
