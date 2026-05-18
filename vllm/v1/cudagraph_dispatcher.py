@@ -65,6 +65,7 @@ class CudagraphDispatcher:
         )
         # Default cudagraph_mode to NONE until initialize_cudagraph_keys is called
         self.cudagraph_mode = CUDAGraphMode.NONE
+        self.max_dycp_reqs = 0  # Updated in initialize_cudagraph_keys
 
     def _compute_bs_to_padded_graph_size(self) -> None:
         """Pre-compute the mapping from batch size to padded graph size."""
@@ -125,6 +126,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        num_dycp_reqs: int = 0
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -143,6 +145,7 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
+            num_dycp_reqs=num_dycp_reqs
         )
 
     def add_cudagraph_key(
@@ -154,11 +157,12 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def initialize_cudagraph_keys(
-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
+        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1, num_dycp_reqs: int = 0
     ):
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        self.max_dycp_reqs = num_dycp_reqs
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -177,13 +181,13 @@ class CudagraphDispatcher:
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
         if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
-            for bs, num_active_loras in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
+            for bs, num_active_loras, dycp_reqs in product(
+                self.compilation_config.cudagraph_capture_sizes, lora_cases, range(num_dycp_reqs + 1),
             ):
                 self.add_cudagraph_key(
                     cudagraph_mode.mixed_mode(),
                     self._create_padded_batch_descriptor(
-                        bs, False, num_active_loras > 0, num_active_loras
+                        bs, False, num_active_loras > 0, num_active_loras, dycp_reqs
                     ).relax_for_mixed_batch_cudagraphs(),
                 )
 
@@ -202,13 +206,13 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
-            for bs, num_active_loras in product(
-                cudagraph_capture_sizes_for_decode, lora_cases
+            for bs, num_active_loras, dycp_reqs in product(
+                cudagraph_capture_sizes_for_decode, lora_cases, range(num_dycp_reqs + 1),
             ):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(
-                        bs, True, num_active_loras > 0, num_active_loras
+                        bs, True, num_active_loras > 0, num_active_loras, dycp_reqs
                     ),
                 )
 
@@ -221,6 +225,7 @@ class CudagraphDispatcher:
         has_lora: bool = False,
         disable_full: bool = False,
         num_active_loras: int = 0,
+        num_dycp_reqs: int = 0
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -237,13 +242,15 @@ class CudagraphDispatcher:
                 return PIECEWISE or NONE only. (can be used for features like
                 cascade attention that are not supported by full cudagraphs)
             num_active_loras: Number of distinct active LoRA adapters.
+            num_dycp_reqs: Number of dynamic contest parallel requests in the batch.
         """
         if (
             not self.keys_initialized
             or self.cudagraph_mode == CUDAGraphMode.NONE
             or num_tokens > self.compilation_config.max_cudagraph_capture_size
+            or num_dycp_reqs > self.max_dycp_reqs
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens=num_tokens, num_dycp_reqs=num_dycp_reqs)
 
         effective_num_active_loras = num_active_loras
         if has_lora and num_active_loras > 0:
@@ -262,7 +269,7 @@ class CudagraphDispatcher:
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
 
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, uniform_decode, has_lora, effective_num_active_loras
+            num_tokens, uniform_decode, has_lora, effective_num_active_loras, num_dycp_reqs
         )
         relaxed_batch_desc = batch_desc.relax_for_mixed_batch_cudagraphs()
 
@@ -281,7 +288,7 @@ class CudagraphDispatcher:
             return CUDAGraphMode.PIECEWISE, relaxed_batch_desc
 
         # finally, just return no cudagraphs and a trivial batch descriptor
-        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens=num_tokens, num_dycp_reqs=num_dycp_reqs)
 
     def get_capture_descs(self) -> list[tuple[CUDAGraphMode, list[BatchDescriptor]]]:
         """
@@ -300,8 +307,8 @@ class CudagraphDispatcher:
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
             descs = list(self.cudagraph_keys[mode])
             if descs:
-                # Sort by num_tokens descending (largest first)
-                descs.sort(key=lambda d: d.num_tokens, reverse=True)
+                # Sort by num_tokens descending, then num_dycp_reqs descending
+                descs.sort(key=lambda d: (d.num_tokens, d.num_dycp_reqs), reverse=True)
                 result.append((mode, descs))
 
         return result

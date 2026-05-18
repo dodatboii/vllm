@@ -38,6 +38,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+    get_dycp_group,
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
@@ -57,6 +58,8 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
+from vllm.v1.engine.utils import set_device_control_env_var
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -66,9 +69,13 @@ class FutureWrapper(Future):
         self,
         futures_queue: deque[tuple["FutureWrapper", Callable]],
         aggregate: Callable = lambda x: x,
+        method = None,
+        output_ranks = None
     ):
         self.futures_queue = futures_queue
         self.aggregate = aggregate
+        self.method = method
+        self.output_ranks = output_ranks
         super().__init__()
 
     def result(self, timeout=None):
@@ -83,6 +90,8 @@ class FutureWrapper(Future):
     def wait_for_response(self, get_response: Callable):
         try:
             response = self.aggregate(get_response())
+            if self.method in ("execute_model", "sample_tokens"):
+                response = [response[idx] for idx in self.output_ranks]
             with suppress(InvalidStateError):
                 self.set_result(response)
         except Exception as e:
@@ -451,6 +460,7 @@ class MultiprocExecutor(Executor):
         )
 
 
+
 @dataclass
 class UnreadyWorkerProcHandle:
     """WorkerProcess handle before READY."""
@@ -501,8 +511,12 @@ class WorkerProc:
     ) -> None:
         if vllm_config.parallel_config.nnodes_within_dp == 1:
             # Initialize MessageQueue for receiving SchedulerOutput
+            """
+            (AOCHEN): Use self.worker.rank is unreasonable.
+            """
             self.rpc_broadcast_mq = MessageQueue.create_from_handle(
-                input_shm_handle, self.worker.rank
+                # input_shm_handle, self.worker.rank
+                input_shm_handle, self.rank
             )
 
             # Initializes a message queue for sending the model output
@@ -882,7 +896,11 @@ class WorkerProc:
         tp_rank = get_tp_group().rank_in_group
         dcp_size = get_dcp_group().world_size
         dcp_rank = get_dcp_group().rank_in_group
+        dycp_size = get_dycp_group().world_size
+        cp_group_index = dp_rank // dycp_size
         process_name = "Worker"
+        if dycp_size > 1:
+            process_name += f"_CPGroup{cp_group_index}"
         if dp_size > 1:
             process_name += f"_DP{dp_rank}"
         if pp_size > 1:
