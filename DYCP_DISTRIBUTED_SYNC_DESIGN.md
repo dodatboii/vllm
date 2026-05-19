@@ -55,8 +55,10 @@ Frontend (DPLBAsyncMPClient)
   CPAwareScheduler    ←─ all-reduce ─→   CPAwareScheduler
 (pending / active CP)                  (pending / active CP)
   MultiprocExecutor                      MultiprocExecutor
- Workers (TP group)   ←─ DYCP comm ─→   Workers (TP group)
+ Workers (TP group)     ←─ 待实现 ─→     Workers (TP group)
 ```
+
+> **注**：Worker 间跨 DP rank 的 attention 通信尚未实现。`_DYCP` 进程组已初始化，`cp_rank` 和 `dycp_local_seq_lens` 已传入 attention backend，但 attention 计算中实际调用 `get_dycp_group()` 进行通信的部分仍待补充。详见第 6 节。
 
 ---
 
@@ -237,7 +239,66 @@ def execute_model(self, scheduler_outputs):
 
 ---
 
-## 6. 请求完整生命周期
+## 6. Attention 通信：与 DCP 的关系
+
+### 6.1 DCP 的工作方式
+
+DCP（Decode Context Parallel）在 TP 组内复用 GPU，将一个序列的 KV cache 按 interleave 方式分片（token `i` 存在 `rank i % dcp_size`）。Attention 计算流程：
+
+```
+all_gather(query, dim=1)          → 每个 rank 拿到完整 query
+flash_attn(full_query, local_kv)  → 每个 rank 计算 partial attention output + LSE
+cp_lse_ag_out_rs(out, lse, dcp_group)
+  ├── all_gather(LSE)             → 聚合所有 rank 的 LSE
+  ├── correct_attn_out(Triton)    → 用 log-sum-exp 修正本地 output
+  └── reduce_scatter(out, dim=1)  → 沿 H 维度分散最终输出
+```
+
+`reduce_scatter(dim=1)` 沿 head 维度分散，是因为 DCP 最终要把 head 分给不同 rank 持有。
+
+### 6.2 DYCP 的需求差异
+
+DYCP 跨 DP rank，每个 rank 存一段序列的**连续** KV（不是 interleave），每个 rank 用本地 query × 本地 KV 计算 attention，得到只看到本段历史的部分结果，再跨 rank 聚合。
+
+| 维度 | DCP | DYCP |
+|------|-----|------|
+| KV 分片方式 | interleave（token 级交错） | 连续分段（每 rank 一段） |
+| Query 处理 | all_gather 到所有 rank | 无需 all_gather，各 rank 用本地 query |
+| Attention 计算 | `full_query × local_kv` | `local_query × local_kv` |
+| 输出聚合 | reduce_scatter（沿 H 维度） | all_reduce（每 rank 保留完整 head） |
+
+### 6.3 可复用的组件
+
+| 组件 | 位置 | 能否复用 | 说明 |
+|------|------|---------|------|
+| `_correct_attn_cp_out_kernel` | `attention/ops/common.py` | **能** | LSE 修正的数学逻辑与分片维度无关 |
+| `_cp_lse_common` | `attention/ops/common.py` | **能** | all_gather LSE + Triton 修正，接口通用 |
+| `cp_lse_ag_out_ar` | `attention/ops/common.py` | **能，直接用** | 用 all_reduce 替代 reduce_scatter，正好对应 DYCP 场景 |
+| `cp_lse_ag_out_rs` | `attention/ops/common.py` | **不能** | reduce_scatter 沿 H 维度，DYCP 不需要分散 head |
+| `_forward_with_dcp` 整体流程 | `attention/backends/flash_attn.py` | **不能** | 依赖 all_gather query 和 interleave KV 布局 |
+
+### 6.4 DYCP Attention 的实现路径
+
+DYCP attention 的核心逻辑应为：
+
+```python
+# 每个 rank 用本地 query × 本地 KV 计算 attention（causal=False，只看本段历史）
+local_out, local_lse = flash_attn_varlen_func(
+    q=local_query, k=local_kv, v=local_kv,
+    seqused_k=dycp_local_seq_lens,
+    causal=False,
+    return_softmax_lse=True,
+)
+
+# 聚合所有 rank 的部分结果，复用现有函数，传入 DYCP 进程组
+final_out = cp_lse_ag_out_ar(local_out, local_lse, get_dycp_group())
+```
+
+不需要 all_gather query，不需要 reduce_scatter head，直接复用 `cp_lse_ag_out_ar` 并传入 `get_dycp_group()` 即可。`dycp_local_seq_lens`（已在 `gpu_model_runner.py` 中计算并传入 attention metadata）提供每个 rank 的本地 KV 长度。
+
+---
+
+## 7. 请求完整生命周期
 
 ```
 1. Frontend 收到长请求
@@ -256,7 +317,7 @@ def execute_model(self, scheduler_outputs):
    → reorder_batch 将 CP 请求移到批次前部
    → compute_domain_slot_mapping 计算本地 slot
    → dycp_local_seq_lens 传入 attention backend
-   → Workers 执行 attention + DYCP 通信
+   → Workers 执行 attention（跨 rank 通信待实现，见第 6 节）
 
 5. 完成
    → update_from_output 检测完成 → 清理 active_cp_requests
@@ -265,7 +326,7 @@ def execute_model(self, scheduler_outputs):
 
 ---
 
-## 7. 性能特性
+## 8. 性能特性
 
 | 场景 | 开销 |
 |------|------|
@@ -276,7 +337,7 @@ def execute_model(self, scheduler_outputs):
 
 ---
 
-## 8. 文件清单
+## 9. 文件清单
 
 ### 新增文件
 
