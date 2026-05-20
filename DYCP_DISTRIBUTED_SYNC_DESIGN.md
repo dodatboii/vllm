@@ -58,7 +58,7 @@ Frontend (DPLBAsyncMPClient)
  Workers (TP group)     ←─ 待实现 ─→     Workers (TP group)
 ```
 
-> **注**：Worker 间跨 DP rank 的 attention 通信尚未实现。`_DYCP` 进程组已初始化，`cp_rank` 和 `dycp_local_seq_lens` 已传入 attention backend，但 attention 计算中实际调用 `get_dycp_group()` 进行通信的部分仍待补充。详见第 6 节。
+> **注**：Worker 间跨 DP rank 的 attention 通信尚未实现。`_DYCP` 进程组已初始化，`cp_rank` 和 `dycp_local_seq_lens` 已传入 attention backend，但 attention 计算中实际调用 `get_dycp_group()` 进行通信的部分仍待补充。DYCP 采用与 DCP 相同的 interleave 分片语义，可直接复用 DCP 的 attention 流程，详见第 6 节。
 
 ---
 
@@ -256,45 +256,53 @@ cp_lse_ag_out_rs(out, lse, dcp_group)
 
 `reduce_scatter(dim=1)` 沿 head 维度分散，是因为 DCP 最终要把 head 分给不同 rank 持有。
 
-### 6.2 DYCP 的需求差异
+### 6.2 DYCP 采用与 DCP 相同的 interleave 分片
 
-DYCP 跨 DP rank，每个 rank 存一段序列的**连续** KV（不是 interleave），每个 rank 用本地 query × 本地 KV 计算 attention，得到只看到本段历史的部分结果，再跨 rank 聚合。
+DYCP 跨 DP rank，采用与 DCP 完全相同的 interleave 分片语义：token `i` 的 KV 存在 `rank = (i // interleave_size) % dycp_size`。两者的本质区别只在于通信域不同：
 
 | 维度 | DCP | DYCP |
 |------|-----|------|
-| KV 分片方式 | interleave（token 级交错） | 连续分段（每 rank 一段） |
-| Query 处理 | all_gather 到所有 rank | 无需 all_gather，各 rank 用本地 query |
-| Attention 计算 | `full_query × local_kv` | `local_query × local_kv` |
-| 输出聚合 | reduce_scatter（沿 H 维度） | all_reduce（每 rank 保留完整 head） |
+| 分片方式 | interleave（token 级交错） | interleave（token 级交错，相同语义） |
+| 通信域 | TP 组内（共享物理 GPU，无跨进程通信） | DP 组间（独立进程，需跨进程通信） |
+| 进程组 | `get_dcp_group()` | `get_dycp_group()` |
+| Query 处理 | all_gather 到所有 rank | all_gather 到所有 rank（相同） |
+| Attention 计算 | `full_query × local_kv` | `full_query × local_kv`（相同） |
+| 输出聚合 | `cp_lse_ag_out_rs`（reduce_scatter 沿 H 维度） | `cp_lse_ag_out_rs`（相同，换进程组） |
+
+interleave 分片的好处：decode 阶段每新生成一个 token，其位置 `pos` 按公式自然落到对应 rank，所有 rank 负载完全均衡（每步各写一个 token），无需额外的分配逻辑。
 
 ### 6.3 可复用的组件
 
+由于分片语义相同，DCP 的 attention 实现几乎可以整体复用，只需将进程组参数从 `get_dcp_group()` 替换为 `get_dycp_group()`：
+
 | 组件 | 位置 | 能否复用 | 说明 |
 |------|------|---------|------|
-| `_correct_attn_cp_out_kernel` | `attention/ops/common.py` | **能** | LSE 修正的数学逻辑与分片维度无关 |
+| `_correct_attn_cp_out_kernel` | `attention/ops/common.py` | **能** | LSE 修正的数学逻辑与进程组无关 |
 | `_cp_lse_common` | `attention/ops/common.py` | **能** | all_gather LSE + Triton 修正，接口通用 |
-| `cp_lse_ag_out_ar` | `attention/ops/common.py` | **能，直接用** | 用 all_reduce 替代 reduce_scatter，正好对应 DYCP 场景 |
-| `cp_lse_ag_out_rs` | `attention/ops/common.py` | **不能** | reduce_scatter 沿 H 维度，DYCP 不需要分散 head |
-| `_forward_with_dcp` 整体流程 | `attention/backends/flash_attn.py` | **不能** | 依赖 all_gather query 和 interleave KV 布局 |
+| `cp_lse_ag_out_rs` | `attention/ops/common.py` | **能，直接用** | 传入 `get_dycp_group()` 即可 |
+| `get_dcp_local_seq_lens` | `attention/backends/utils.py` | **能，已在用** | `dycp_local_seq_lens` 计算已复用此函数 |
+| `_forward_with_dcp` 整体流程 | `attention/backends/flash_attn.py` | **能** | 换 `get_dycp_group()`，加 CP/非 CP 请求分支 |
+| `compute_slot_mapping` interleave 逻辑 | `worker/block_table.py` | **能** | `compute_domain_slot_mapping` 应复用此逻辑，换 dycp group 参数 |
 
 ### 6.4 DYCP Attention 的实现路径
 
-DYCP attention 的核心逻辑应为：
+参照 `_forward_with_dcp`，DYCP attention 的核心逻辑为：
 
 ```python
-# 每个 rank 用本地 query × 本地 KV 计算 attention（causal=False，只看本段历史）
+# 与 DCP 相同：all_gather query，用完整 query × 本地 interleave KV
+query_across_dycp = get_dycp_group().all_gather(query, dim=1)
 local_out, local_lse = flash_attn_varlen_func(
-    q=local_query, k=local_kv, v=local_kv,
-    seqused_k=dycp_local_seq_lens,
+    q=query_across_dycp, k=local_kv, v=local_kv,
+    seqused_k=dycp_local_seq_lens,   # 本 rank 存储的 token 数
     causal=False,
     return_softmax_lse=True,
 )
 
-# 聚合所有 rank 的部分结果，复用现有函数，传入 DYCP 进程组
-final_out = cp_lse_ag_out_ar(local_out, local_lse, get_dycp_group())
+# 与 DCP 相同：LSE 聚合 + 修正 + reduce_scatter，只换进程组
+final_out = cp_lse_ag_out_rs(local_out, local_lse, get_dycp_group())
 ```
 
-不需要 all_gather query，不需要 reduce_scatter head，直接复用 `cp_lse_ag_out_ar` 并传入 `get_dycp_group()` 即可。`dycp_local_seq_lens`（已在 `gpu_model_runner.py` 中计算并传入 attention metadata）提供每个 rank 的本地 KV 长度。
+`compute_domain_slot_mapping`（当前悬空调用，尚未实现）应复用 `compute_slot_mapping` 的 interleave 逻辑，对批次前 `num_cp_reqs` 行使用 `dycp_world_size`/`dycp_rank` 参数，其余行走标准路径。
 
 ---
 
