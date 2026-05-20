@@ -142,7 +142,7 @@ class CPAwareScheduler(Scheduler):
         if self.cp_sync is None or not self.pending_cp_requests:
             return
 
-        pending_ids = list(self.pending_cp_requests.keys())
+        pending_ids = sorted(self.pending_cp_requests.keys())
 
         # Check local schedulability: can we allocate blocks for our portion?
         can_schedule: list[bool] = []
@@ -182,7 +182,7 @@ class CPAwareScheduler(Scheduler):
         if not self.active_cp_requests or self.cp_sync is None:
             return
 
-        active_ids = list(self.active_cp_requests.keys())
+        active_ids = sorted(self.active_cp_requests.keys())
         needs_preempt: list[bool] = []
         num_free = self.kv_cache_manager.block_pool.get_num_free_blocks()
         for req_id in active_ids:
