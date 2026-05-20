@@ -56,9 +56,3 @@ class OffloadingSpecFactory:
 OffloadingSpecFactory.register_spec(
     "CPUOffloadingSpec", "vllm.v1.kv_offload.cpu", "CPUOffloadingSpec"
 )
-
-KVConnectorFactory.register_connector(
-    "CrossDPExampleConnector",
-    "vllm.distributed.kv_transfer.kv_connector.v1.cross_dp_example_connector",
-    "CrossDPExampleConnector",
-)
