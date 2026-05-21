@@ -3,8 +3,7 @@
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import get_dcp_group, get_pcp_group
-from vllm.distributed.parallel_state import get_dycp_group
+from vllm.distributed import get_dcp_group, get_dycp_group, get_pcp_group
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -44,20 +43,17 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                 )
 
 
+def _safe_group_world_size(get_group_fn) -> int:
+    """Return world_size for a process group, or 1 if not yet initialized."""
+    try:
+        return get_group_fn().world_size
+    except AssertionError:
+        return 1
+
+
 def get_total_cp_world_size():
-    try:
-        pcp_world_size = get_pcp_group().world_size
-    except AssertionError:
-        # PCP might not be initialized in testing
-        pcp_world_size = 1
-    try:
-        dcp_world_size = get_dcp_group().world_size
-    except AssertionError:
-        # DCP might not be initialized in testing
-        dcp_world_size = 1
-    try:
-        dycp_world_size = get_dycp_group().world_size
-    except AssertionError:
-        # DYCP might not be initialized in testing
-        dycp_world_size = 1
-    return dcp_world_size * pcp_world_size * dycp_world_size
+    return (
+        _safe_group_world_size(get_pcp_group)
+        * _safe_group_world_size(get_dcp_group)
+        * _safe_group_world_size(get_dycp_group)
+    )

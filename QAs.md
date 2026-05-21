@@ -185,3 +185,36 @@ CPSyncProtocol 的 all-reduce 本身就是一个同步点，每 4 步强制对�
   2. decode 每步：所有 rank 都执行这条请求（NCCL 通信天然保证，不需要额外机制）
 
 当前 attention 通信本身实现需要 check。
+
+
+
+
+#### 6、如果 prompt 是短序列，decode 推成了长序列，应该怎么操作？
+
+---
+**当前方案没有处理这个场景，且架构上无法优雅迁移。**
+
+请求分类在 `add_request` 时一次性完成，依据是 prefill token 数：
+
+```python
+def _is_long_request(self, request):
+    num_prefill_tokens = request.num_tokens - request.num_output_tokens
+    return num_prefill_tokens >= self.long_request_threshold
+```
+
+一旦被分类为短序列，KV cache 只在单个 DP rank 上分配，decode 阶段不会触发重新分类。
+
+**如果强行在 decode 中途迁移到 CP 模式，面临三个问题：**
+
+1. **KV cache 搬运**：已积累的 KV cache 需要按 interleave 规则重新分布到所有 CP rank，涉及跨进程大量数据传输，代价极高。
+2. **调度协调**：需要通知所有其他 rank 接管这条请求，相当于在 decode 中途重新走一遍 CPSyncProtocol 批准流程。
+3. **block table 重建**：单 rank 的 block table 布局与 interleave 分片布局完全不同，需要重新映射。
+
+---
+**三个务实的处理方向：**
+
+**方向一（当前隐含行为）：接受退化，不迁移。** 短序列 decode 变长后继续在单 rank 上跑完，不做 CP。代价是该请求占用单 rank 的 KV cache 比预期多，可能触发 preemption。
+
+**方向二：用更保守的阈值。** 把 `long_request_threshold` 设低，让更多请求走 CP 路径，减少"短序列 decode 变长"的概率。代价是更多短序列走了不必要的 CP，增加通信开销。
+
+**方向三（推荐）：基于 prompt + max_new_tokens 分类。** 在 `add_request` 时用 `prompt_tokens + max_new_tokens` 判断是否走 CP，而不是只看 prompt 长度。实现成本低，只需修改 `_is_long_request` 的判断逻辑。缺点是 `max_new_tokens` 不一定准确（用户可能设很大的值），可能导致过多请求走 CP。
