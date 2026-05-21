@@ -186,6 +186,8 @@ async def add_request_async(self, request):
         await _send_input(ADD, request, chosen)
 ```
 
+广播的是完整的 `EngineCoreRequest` 对象（含完整 `prompt_token_ids`），同一份数据被序列化 `dycp_size` 次通过 ZMQ 发送。对于 100K token 的序列，单份约 400KB，`dycp_size=4` 时总传输约 1.6MB，相对于长序列 prefill 计算时间可忽略。
+
 **Abort 路由**
 ```python
 async def abort_requests_async(self, request_ids):

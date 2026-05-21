@@ -218,3 +218,28 @@ def _is_long_request(self, request):
 **方向二：用更保守的阈值。** 把 `long_request_threshold` 设低，让更多请求走 CP 路径，减少"短序列 decode 变长"的概率。代价是更多短序列走了不必要的 CP，增加通信开销。
 
 **方向三（推荐）：基于 prompt + max_new_tokens 分类。** 在 `add_request` 时用 `prompt_tokens + max_new_tokens` 判断是否走 CP，而不是只看 prompt 长度。实现成本低，只需修改 `_is_long_request` 的判断逻辑。缺点是 `max_new_tokens` 不一定准确（用户可能设很大的值），可能导致过多请求走 CP。
+
+
+
+#### 7、Frontend 广播长请求到所有 DP engine，广播的是 request_id 还是完整 prompt？
+
+---
+**广播的是完整的 `EngineCoreRequest` 对象，包含完整 prompt。**
+
+`DPLBAsyncMPClient.add_request_async`（`core_client.py`）对每个 engine 调用：
+
+```python
+self._send_input(EngineCoreRequestType.ADD, request, engine)
+```
+
+`request` 是完整的 `EngineCoreRequest`，包含 `prompt_token_ids`（完整 token 列表）、`mm_features`、`prompt_embeds`、`sampling_params` 等所有字段。同一份数据被序列化 `dycp_size` 次，通过 ZMQ 分别发给每个 DP engine 进程。
+
+---
+**开销分析**
+
+对于 100K token 的长序列，每个 token ID 约 4 字节，单份序列化数据约 400KB，`dycp_size=4` 时总传输量约 1.6MB。ZMQ 在同机器上走 Unix socket 或 TCP loopback，带宽 GB/s 级，延迟在毫秒以内，相对于长序列 prefill 的计算时间（秒级）可以忽略。
+
+---
+**潜在优化方向**
+
+若未来需要优化，可改为只广播 `request_id` + 元数据，让各 engine 从共享内存获取 prompt 数据，避免重复序列化。当前实现选择了简单直接的方案。
