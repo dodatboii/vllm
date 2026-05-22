@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.v1.core.sched.cp_sync import CPSyncProtocol
+from vllm.v1.core.sched.cp_sync import (
+    NOT_SCHEDULED,
+    PREEMPTED,
+    SCHEDULED,
+    CPSyncProtocol,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs
@@ -75,6 +80,9 @@ class CPAwareScheduler(Scheduler):
         self.pending_cp_requests: dict[str, Request] = {}
         self.active_cp_requests: dict[str, Request] = {}
 
+        # Tracks CP requests preempted by schedule() in the current step.
+        self._preempted_this_step: set[str] = set()
+
         # CP sync protocol (None if dp_group not provided, e.g., single DP).
         self.cp_sync: CPSyncProtocol | None = None
         if dp_group is not None and self.cp_world_size > 1:
@@ -135,7 +143,7 @@ class CPAwareScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def run_cp_sync(self) -> None:
-        """Execute CP sync protocol to activate pending requests.
+        """Execute CP sync: announce pending requests to all ranks.
 
         Called from DPEngineCoreProc busy loop at sync intervals.
         """
@@ -144,27 +152,10 @@ class CPAwareScheduler(Scheduler):
 
         # Sort to guarantee identical slot-to-request mapping across all ranks.
         pending_ids = sorted(self.pending_cp_requests.keys())
+        announced_ids = self.cp_sync.sync_announce(pending_ids)
 
-        # Check local schedulability: can we allocate blocks for our portion?
-        can_schedule: list[bool] = []
-        num_free = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        for req_id in pending_ids:
-            request = self.pending_cp_requests[req_id]
-            local_tokens = self._get_local_cp_tokens(
-                request.num_tokens - request.num_computed_tokens
-            )
-            num_blocks_needed = (local_tokens + self.block_size - 1) // self.block_size
-            can_schedule.append(num_blocks_needed <= num_free)
-
-        # Distributed consensus.
-        approved_ids = self.cp_sync.sync_cp_schedule(pending_ids, can_schedule)
-
-        # Activate approved requests.
-        for req_id in approved_ids:
+        for req_id in announced_ids:
             self._activate_cp_request(req_id)
-
-        # Also sync preemption for active CP requests.
-        self._sync_cp_preemption()
 
     def _activate_cp_request(self, request_id: str) -> None:
         """Move a CP request from pending to active (running queue)."""
@@ -178,45 +169,11 @@ class CPAwareScheduler(Scheduler):
             self.cp_rank,
         )
 
-    def _sync_cp_preemption(self) -> None:
-        """Check and propagate preemption needs for active CP requests."""
-        if not self.active_cp_requests or self.cp_sync is None:
-            return
-
-        # Sort to guarantee identical slot-to-request mapping across all ranks.
-        active_ids = sorted(self.active_cp_requests.keys())
-        needs_preempt: list[bool] = []
-        num_free = self.kv_cache_manager.block_pool.get_num_free_blocks()
-        for req_id in active_ids:
-            # A rank needs preemption if it can't allocate the next decode block.
-            local_tokens = self._get_local_cp_tokens(1)  # decode: 1 token
-            num_blocks_needed = (local_tokens + self.block_size - 1) // self.block_size
-            needs_preempt.append(num_blocks_needed > num_free)
-
-        preempted_ids = self.cp_sync.sync_preemption(active_ids, needs_preempt)
-
-        for req_id in preempted_ids:
-            self._preempt_cp_request(req_id)
-
-    def _preempt_cp_request(self, request_id: str) -> None:
-        """Preempt a CP request: remove from running, free blocks."""
-        if request_id not in self.active_cp_requests:
-            return
-        request = self.active_cp_requests.pop(request_id)
-        # Remove from running queue if present.
-        if request in self.running:
-            self.running.remove(request)
-        # Free KV cache blocks.
-        self.kv_cache_manager.free(request)
-        # Move back to pending for retry.
-        request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
-        self.pending_cp_requests[request.request_id] = request
-        logger.debug(
-            "CP request %s preempted on rank %d",
-            request_id,
-            self.cp_rank,
-        )
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Override to track CP requests preempted by schedule()."""
+        if request.request_id in self.active_cp_requests:
+            self._preempted_this_step.add(request.request_id)
+        super()._preempt_request(request, timestamp)
 
     # ------------------------------------------------------------------
     # Schedule override: add CP metadata to output
@@ -224,6 +181,7 @@ class CPAwareScheduler(Scheduler):
 
     def schedule(self) -> SchedulerOutput:
         """Schedule requests, adding CP metadata to output."""
+        self._preempted_this_step.clear()
         output = super().schedule()
 
         # Annotate output with CP metadata.
@@ -250,6 +208,124 @@ class CPAwareScheduler(Scheduler):
             output.cp_rank_scheduled_tokens[req_id] = self.cp_world_size
 
         return output
+
+    # ------------------------------------------------------------------
+    # Post-schedule CP sync: consensus based on actual schedule result
+    # ------------------------------------------------------------------
+
+    def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
+        """Post-schedule sync: consensus on actual scheduling results."""
+        if not self.active_cp_requests or self.cp_sync is None:
+            self._preempted_this_step.clear()
+            return output
+
+        active_ids = sorted(self.active_cp_requests.keys())
+
+        status: list[int] = []
+        for req_id in active_ids:
+            if req_id in output.num_scheduled_tokens:
+                status.append(SCHEDULED)
+            elif req_id in self._preempted_this_step:
+                status.append(PREEMPTED)
+            else:
+                status.append(NOT_SCHEDULED)
+
+        confirmed, soft_rollback_ids, hard_rollback_ids = (
+            self.cp_sync.sync_schedule_confirm(active_ids, status)
+        )
+
+        if soft_rollback_ids:
+            output = self._soft_rollback(output, soft_rollback_ids)
+        if hard_rollback_ids:
+            output = self._hard_rollback(output, hard_rollback_ids)
+
+        self._preempted_this_step.clear()
+
+        # Pass sorted confirmed CP req IDs to workers for index computation.
+        if confirmed:
+            output.cp_req_ids_sorted = sorted(confirmed)
+        else:
+            output.cp_req_ids_sorted = None
+
+        return output
+
+    def _soft_rollback(
+        self, output: SchedulerOutput, rollback_ids: list[str]
+    ) -> SchedulerOutput:
+        """Remove from output without resetting num_computed_tokens."""
+        for req_id in rollback_ids:
+            if req_id in output.num_scheduled_tokens:
+                num_tokens = output.num_scheduled_tokens.pop(req_id)
+                output.total_num_scheduled_tokens -= num_tokens
+                self._remove_req_from_output(output, req_id)
+
+                request = self.active_cp_requests[req_id]
+                self.kv_cache_manager.free(request)
+
+                request.status = RequestStatus.WAITING
+                if request in self.running:
+                    self.running.remove(request)
+                self.waiting.prepend_request(request)
+
+        return output
+
+    def _hard_rollback(
+        self, output: SchedulerOutput, rollback_ids: list[str]
+    ) -> SchedulerOutput:
+        """Full rollback: all ranks preempt, reset num_computed_tokens=0."""
+        for req_id in rollback_ids:
+            if req_id in output.num_scheduled_tokens:
+                num_tokens = output.num_scheduled_tokens.pop(req_id)
+                output.total_num_scheduled_tokens -= num_tokens
+                self._remove_req_from_output(output, req_id)
+
+            request = self.active_cp_requests[req_id]
+
+            if req_id not in self._preempted_this_step:
+                # schedule() did not preempt this rank; do it manually.
+                self.kv_cache_manager.free(request)
+                request.num_computed_tokens = 0
+                request.status = RequestStatus.PREEMPTED
+                if request in self.running:
+                    self.running.remove(request)
+
+            del self.active_cp_requests[req_id]
+            self.pending_cp_requests[req_id] = request
+            if request not in self.waiting:
+                self.waiting.prepend_request(request)
+
+        return output
+
+    def _remove_req_from_output(
+        self, output: SchedulerOutput, req_id: str
+    ) -> None:
+        """Remove a request from all SchedulerOutput fields."""
+        output.scheduled_new_reqs = [
+            r for r in output.scheduled_new_reqs if r.req_id != req_id
+        ]
+
+        cached = output.scheduled_cached_reqs
+        if req_id in cached.req_ids:
+            idx = cached.req_ids.index(req_id)
+            cached.req_ids.pop(idx)
+            cached.new_token_ids.pop(idx)
+            cached.new_block_ids.pop(idx)
+            cached.num_computed_tokens.pop(idx)
+            cached.num_output_tokens.pop(idx)
+            cached.resumed_req_ids.discard(req_id)
+            if req_id in cached.all_token_ids:
+                del cached.all_token_ids[req_id]
+
+        if output.cp_rank_scheduled_tokens and req_id in output.cp_rank_scheduled_tokens:
+            del output.cp_rank_scheduled_tokens[req_id]
+        if output.cp_rank_to_req_id and req_id in output.cp_rank_to_req_id:
+            output.cp_rank_to_req_id.remove(req_id)
+        if output.req_id_to_cp_size and req_id in output.req_id_to_cp_size:
+            del output.req_id_to_cp_size[req_id]
+        output.num_cp_request = max(0, output.num_cp_request - 1)
+
+        if output.scheduled_spec_decode_tokens and req_id in output.scheduled_spec_decode_tokens:
+            del output.scheduled_spec_decode_tokens[req_id]
 
     # ------------------------------------------------------------------
     # Update from output: handle CP request completion
