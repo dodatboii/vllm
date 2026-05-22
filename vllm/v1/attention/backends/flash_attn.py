@@ -211,6 +211,9 @@ class FlashAttentionMetadata:
     max_dcp_context_kv_len: int | None = None
     dcp_context_kv_lens: torch.Tensor | None = None
 
+    # For DYCP: indices of CP requests in the batch (request dimension).
+    cp_req_indices: list[int] | None = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -499,6 +502,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
+            cp_req_indices=common_attn_metadata.cp_req_indices,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -698,6 +702,20 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                 )
                 return output
+            elif attn_metadata.cp_req_indices:
+                self._forward_with_dycp(
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                return output
             else:
                 sliding_window_size = (
                     list(self.sliding_window)
@@ -876,6 +894,38 @@ class FlashAttentionImpl(AttentionImpl):
             context_lse_cor,
             query_attn_out,
             query_lse,
+        )
+
+    def _forward_with_dycp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        q_descale: torch.Tensor | None = None,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> None:
+        """Forward pass for batches containing DYCP (dynamic CP) requests.
+
+        CP requests are identified by attn_metadata.cp_req_indices.
+        The batch may contain a mix of CP and non-CP requests.
+
+        Implementation plan:
+        1. Convert cp_req_indices (request-level) to token ranges using
+           query_start_loc, producing cp_token_idx and non_cp_token_idx.
+        2. CP tokens: gather queries across DYCP ranks, run cross-rank
+           flash_attn_varlen_func with dycp_local_seq_lens as seqused_k,
+           then reduce via cp_lse_ag_out_rs and scatter back.
+        3. Non-CP tokens: run normal flash_attn_varlen_func in-place.
+        """
+        raise NotImplementedError(
+            "_forward_with_dycp is not yet implemented. "
+            "This stub wires up the dispatch path; the actual cross-rank "
+            "attention logic will be added in a follow-up."
         )
 
     def _forward_encoder_attention(
