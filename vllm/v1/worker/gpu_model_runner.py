@@ -119,7 +119,6 @@ from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
-    reorder_batch_to_split_cp_and_normal,
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -873,7 +872,7 @@ class GPUModelRunner(
             )
 
         if scheduler_output.num_cp_request > 0:
-            pass  # reorder removed; CP requests handled via index-based gather
+            pass  # CP requests handled via index-based gather; no reorder needed
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
