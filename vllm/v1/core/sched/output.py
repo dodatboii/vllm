@@ -252,6 +252,9 @@ class SchedulerOutput:
 
     none_tokens_in_peer_sched: bool = False
 
+    # Sorted active CP request IDs; workers use this to compute batch indices.
+    cp_req_ids_sorted: list[str] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
