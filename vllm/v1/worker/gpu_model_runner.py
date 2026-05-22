@@ -873,10 +873,7 @@ class GPUModelRunner(
             )
 
         if scheduler_output.num_cp_request > 0:
-            reorder_batch_to_split_cp_and_normal(
-                self.input_batch,
-                scheduler_output,
-            )
+            pass  # reorder removed; CP requests handled via index-based gather
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
         """Initialize attributes from torch.cuda.get_device_properties"""
@@ -1695,6 +1692,19 @@ class GPUModelRunner(
             spec_decode_metadata,
         )
 
+    def _compute_cp_req_indices(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[int] | None:
+        """Compute CP request indices in input_batch order."""
+        if not scheduler_output.cp_req_ids_sorted:
+            return None
+        indices = []
+        for req_id in scheduler_output.cp_req_ids_sorted:
+            idx = self.input_batch.req_id_to_index.get(req_id)
+            if idx is not None:
+                indices.append(idx)
+        return indices if indices else None
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -1709,7 +1719,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-        num_dycp_reqs: int = 0,
+        cp_req_indices: list[int] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1782,7 +1792,7 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
-            num_dycp_reqs=num_dycp_reqs,    
+            cp_req_indices=cp_req_indices,
         )
 
         if self.dcp_world_size > 1:
@@ -1801,13 +1811,23 @@ class GPUModelRunner(
             ]
 
         if self.cp_world_size > 1:
-            self.dycp_local_seq_lens.cpu[:num_dycp_reqs] = get_dcp_local_seq_lens(
-                self.seq_lens.cpu[:num_dycp_reqs],
-                self.cp_world_size,
-                self.cp_rank,
-                self.parallel_config.cp_kv_cache_interleave_size,
+            # Default: copy all seq_lens as-is.
+            self.dycp_local_seq_lens.cpu[:num_reqs].copy_(
+                self.seq_lens.cpu[:num_reqs]
             )
-            self.dycp_local_seq_lens.cpu[num_dycp_reqs:num_reqs].copy_(self.seq_lens.cpu[num_dycp_reqs:num_reqs])
+            # Override CP request entries with local token counts.
+            if cp_req_indices:
+                cp_idx_tensor = torch.tensor(
+                    cp_req_indices, dtype=torch.long
+                )
+                cp_seq_lens = self.seq_lens.cpu[cp_idx_tensor]
+                local_cp_lens = get_dcp_local_seq_lens(
+                    cp_seq_lens,
+                    self.cp_world_size,
+                    self.cp_rank,
+                    self.parallel_config.cp_kv_cache_interleave_size,
+                )
+                self.dycp_local_seq_lens.cpu[cp_idx_tensor] = local_cp_lens
             self.dycp_local_seq_lens.cpu[num_reqs:].fill_(0)
             self.dycp_local_seq_lens.copy_to_gpu(num_reqs_padded)
 
@@ -3534,7 +3554,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
-                    num_dycp_reqs=scheduler_output.num_cp_request,
+                    cp_req_indices=self._compute_cp_req_indices(scheduler_output),
                 )
             )
 
