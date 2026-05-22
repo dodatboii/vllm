@@ -326,11 +326,22 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    dycp_local_seq_lens: torch.Tensor | None = None
+    dycp_local_seq_lens_cpu: torch.Tensor | None = None
+    """Sequence lengths of the local rank in dynamic context parallelism world"""
+
+    # Indices into input_batch for CP requests; None when no CP requests.
+    cp_req_indices: list[int] | None = None
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
 
     _num_computed_tokens_cache: torch.Tensor | None = None
+
+    @property
+    def num_dycp_reqs(self) -> int:
+        return len(self.cp_req_indices) if self.cp_req_indices else 0
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
