@@ -23,6 +23,11 @@ logger = init_logger(__name__)
 # Maximum number of CP requests that can be synced in one round.
 MAX_CP_SYNC_SLOTS = 32
 
+# Three-state encoding for post-schedule consensus.
+SCHEDULED = 2
+NOT_SCHEDULED = 1
+PREEMPTED = 0
+
 
 class CPSyncProtocol:
     """Distributed consensus protocol for CP request scheduling.
@@ -66,36 +71,32 @@ class CPSyncProtocol:
         self._announce_tensor = torch.zeros(
             MAX_CP_SYNC_SLOTS, dtype=torch.int32, device="cpu"
         )
+        # Confirm tensor: post-schedule three-state consensus.
+        self._confirm_tensor = torch.zeros(
+            MAX_CP_SYNC_SLOTS, dtype=torch.int32, device="cpu"
+        )
 
     def should_sync(self) -> bool:
         """Check if this step is a sync point."""
         self.step_counter += 1
         return self.step_counter % self.sync_interval == 0
 
-    def sync_cp_schedule(
+    def sync_announce(
         self,
         pending_request_ids: list[str],
-        can_schedule: list[bool],
     ) -> list[str]:
-        """Two-phase commit for CP request scheduling.
+        """Announce phase: confirm all ranks have received the same requests.
 
         Args:
-            pending_request_ids: CP request IDs pending on this rank.
-            can_schedule: For each pending request, whether this rank
-                          has enough KV cache blocks for its portion.
+            pending_request_ids: CP request IDs pending on this rank (sorted).
 
         Returns:
-            List of request IDs approved for scheduling (all DPs agreed).
+            List of request IDs known to ALL ranks.
         """
-        num_pending = len(pending_request_ids)
-        if num_pending == 0:
+        num_slots = min(len(pending_request_ids), MAX_CP_SYNC_SLOTS)
+        if num_slots == 0:
             return []
 
-        num_slots = min(num_pending, MAX_CP_SYNC_SLOTS)
-
-        # Phase 1: Announce which requests this rank knows about.
-        # Each rank sets a 1 for requests it has. all-reduce with MIN:
-        # result is 1 only if ALL ranks have that request.
         self._announce_tensor.zero_()
         for i in range(num_slots):
             self._announce_tensor[i] = 1
@@ -106,33 +107,73 @@ class CPSyncProtocol:
             group=self.dp_group,
         )
 
-        # Phase 2: For requests known to all ranks, vote on schedulability.
-        self._vote_tensor.zero_()
+        announced: list[str] = []
         for i in range(num_slots):
-            if self._announce_tensor[i].item() == 1 and can_schedule[i]:
-                self._vote_tensor[i] = 1
+            if self._announce_tensor[i].item() == 1:
+                announced.append(pending_request_ids[i])
+
+        if announced:
+            logger.debug(
+                "CP announce: %d/%d requests known to all ranks on rank %d",
+                len(announced),
+                len(pending_request_ids),
+                self.cp_rank,
+            )
+
+        return announced
+
+    def sync_schedule_confirm(
+        self,
+        active_ids: list[str],
+        status: list[int],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Post-schedule consensus using three-state encoding.
+
+        Args:
+            active_ids: Active CP request IDs (sorted, identical across ranks).
+            status: Per-request status on this rank
+                    (SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0).
+
+        Returns:
+            (confirmed_ids, soft_rollback_ids, hard_rollback_ids)
+        """
+        num_slots = min(len(active_ids), MAX_CP_SYNC_SLOTS)
+        if num_slots == 0:
+            return [], [], []
+
+        self._confirm_tensor.zero_()
+        for i in range(num_slots):
+            self._confirm_tensor[i] = status[i]
 
         torch.distributed.all_reduce(
-            self._vote_tensor[:num_slots],
+            self._confirm_tensor[:num_slots],
             op=torch.distributed.ReduceOp.MIN,
             group=self.dp_group,
         )
 
-        # Collect approved request IDs.
-        approved: list[str] = []
+        confirmed: list[str] = []
+        soft_rollback: list[str] = []
+        hard_rollback: list[str] = []
         for i in range(num_slots):
-            if self._vote_tensor[i].item() == 1:
-                approved.append(pending_request_ids[i])
+            val = self._confirm_tensor[i].item()
+            if val >= SCHEDULED:
+                confirmed.append(active_ids[i])
+            elif val >= NOT_SCHEDULED:
+                soft_rollback.append(active_ids[i])
+            else:
+                hard_rollback.append(active_ids[i])
 
-        if approved:
+        if soft_rollback or hard_rollback:
             logger.debug(
-                "CP sync: approved %d/%d requests on rank %d",
-                len(approved),
-                num_pending,
+                "CP confirm: confirmed=%d soft_rollback=%d hard_rollback=%d"
+                " on rank %d",
+                len(confirmed),
+                len(soft_rollback),
+                len(hard_rollback),
                 self.cp_rank,
             )
 
-        return approved
+        return confirmed, soft_rollback, hard_rollback
 
     def sync_preemption(
         self,
