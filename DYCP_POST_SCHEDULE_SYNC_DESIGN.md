@@ -6,7 +6,7 @@
 
 当前设计将 CP 请求的跨 rank 同步放在 `schedule()` 调用之前：
 
-```
+```python
 _maybe_run_cp_sync()   ← 同步点：投票决定长请求是否可调度
     ↓
 schedule()             ← token_budget 限制、preemption 逻辑
@@ -32,7 +32,7 @@ schedule()             ← token_budget 限制、preemption 逻辑
 
 ## 2. 新架构
 
-```
+```python
 schedule()                    ← 各 rank 独立调度，长请求可能被调度也可能不被调度
     ↓
 _post_schedule_cp_sync()      ← 新同步点：基于 SchedulerOutput 做共识
@@ -51,7 +51,7 @@ _post_schedule_cp_sync()      ← 新同步点：基于 SchedulerOutput 做共�
 后置同步需要区分"未被调度"的两种原因，因为它们对请求状态的影响不同：
 
 | 状态码 | 含义 | 对 `num_computed_tokens` 的影响 |
-|--------|------|-------------------------------|
+|--------|:-----|-------------------------------|
 | `SCHEDULED = 2` | 请求被正常调度 | 不变（等待执行后增加） |
 | `NOT_SCHEDULED = 1` | 未调度，留在 waiting（token_budget 不够等） | 不变 |
 | `PREEMPTED = 0` | 被 `schedule()` 内部 preempt（KV blocks 不够） | 已被重置为 0 |
@@ -597,19 +597,47 @@ class CPAwareScheduler:
 ### 10.3 调用链
 
 ```python
-# engine/core.py
-def _process_engine_step(self):
-    # 前置：仅 announce（按间隔）
-    self._maybe_run_cp_announce()
-    
-    # 调度
+# engine/core.py — DPEngineCoreProc.run_busy_loop()
+while True:
+    self._process_input_queue()
+
+    # 前置：仅 announce（按 sync_interval 间隔，有 pending CP 请求时触发）
+    self._maybe_run_cp_sync()   # 内部调用 scheduler.run_cp_sync()（已简化为仅 announce）
+
+    executed = self._process_engine_step()
+    ...
+
+# engine/core.py — _maybe_run_cp_sync()
+def _maybe_run_cp_sync(self) -> None:
+    scheduler = self.scheduler
+    if (
+        hasattr(scheduler, "cp_sync")
+        and scheduler.cp_sync is not None
+        and scheduler.has_pending_cp_requests()
+        and scheduler.cp_sync.should_sync()
+    ):
+        scheduler.run_cp_sync()
+
+# engine/core.py — EngineCore.step()
+def step(self):
     scheduler_output = self.scheduler.schedule()
-    
-    # 后置：确认 + 回滚（每步，如果有 active CP 请求）
+
+    # 后置：确认 + 回滚（每步，只要 scheduler 支持该方法）
     if hasattr(self.scheduler, 'post_schedule_cp_sync'):
         scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
-    
-    # 下发
+
+    future = self.model_executor.execute_model(scheduler_output, non_block=True)
+    ...
+
+# engine/core.py — EngineCore.step_with_batch_queue()（batch queue 路径同样插入）
+def step_with_batch_queue(self):
+    if self.scheduler.has_requests():
+        scheduler_output = self.scheduler.schedule()
+
+        if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+            scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
+
+        exec_future = self.model_executor.execute_model(scheduler_output, non_block=True)
     ...
 ```
 
@@ -626,3 +654,115 @@ def _process_engine_step(self):
 - 去掉 batch reorder，改用 index-based gather/scatter，保持 FCFS 语义不被破坏
 
 这种设计将"是否能调度"的判断完全交给 `schedule()` 本身，同步层只负责"确认一致性"，职责更清晰，一致性保证更强。
+
+---
+
+## 附：Scheduler.schedule() 完整流程
+
+### 总体结构
+
+schedule()
+├── 1. 调度 RUNNING 请求
+├── 2. 调度 WAITING 请求
+├── 3. 构建 SchedulerOutput
+└── 4. `_update_after_schedule()`
+
+---
+
+### 1. 调度 RUNNING 请求（running queue 优先）
+
+**遍历 self.running**，对每个请求：
+
+**计算 num_new_tokens**
+
+- 基础值：num_tokens_with_spec + num_output_placeholders - num_computed_tokens
+- 受 long_prefill_token_threshold、token_budget、max_model_len 三重截断
+
+**特殊跳过条件**
+
+- async scheduling 下已确认达到 max_tokens 的请求 → continue
+- encoder budget 耗尽 / encoder cache 耗尽 / mamba block 对齐失败 → num_new_tokens=0 → continue（不 break，允许后续低优先级请求继续）
+
+**分配 KV blocks（kv_cache_manager.allocate_slots）**
+
+- 成功 → 记录到 req_to_new_blocks、num_scheduled_tokens，扣减 token_budget
+- 失败 → 触发 preempt 循环：
+  - FCFS 策略：弹出 running 末尾最低优先级请求
+  - PRIORITY 策略：弹出全局最低优先级请求（可能撤销本步已调度的请求）
+  - 调用 `_preempt_request()`：释放 KV cache、重置 num_computed_tokens=0、状态改为 PREEMPTED、放回 waiting 队头
+  - 若被 preempt 的就是当前请求本身 → break，停止调度
+
+**spec decode 处理**：记录本步实际调度的 spec token 数到 scheduled_spec_decode_tokens
+
+**encoder inputs 处理**：分配 encoder cache，更新 encoder budget
+
+---
+
+### 2. 调度 WAITING 请求
+
+**前提：本步没有发生 preempt（if not preempted_reqs），且 running 未满、token_budget > 0**
+
+**对每个 waiting 请求，先检查跳过条件**（放入 skipped_waiting_requests 后 continue）：
+
+- WAITING_FOR_REMOTE_KVS：KV transfer 未完成
+- WAITING_FOR_FSM：结构化输出 FSM 编译未完成
+- WAITING_FOR_STREAMING_REQ：流式输入未就绪
+- LoRA 数量超限
+
+**prefix cache 查询**（仅 num_computed_tokens == 0 时）
+
+- 本地：kv_cache_manager.get_computed_blocks() → num_new_local_computed_tokens
+- 外部（KVConnector）：connector.get_num_new_matched_tokens() → num_external_computed_tokens
+
+**计算 num_new_tokens**
+
+- request.num_tokens - num_computed_tokens，受 threshold 和 token_budget 截断
+- chunked prefill 未开启时，超出 budget 直接 break
+
+**分配 KV blocks**
+
+- 失败 → break（waiting 请求不触发 preempt）
+- 成功 → 从 waiting 弹出，加入 running
+  - 状态 WAITING → scheduled_new_reqs
+  - 状态 PREEMPTED → scheduled_resumed_reqs
+  - 更新 request.num_computed_tokens = num_computed_tokens（prefix cache 命中数）
+
+**循环结束后，skipped_waiting_requests 放回 waiting 队头。**
+
+---
+
+### 3. 构建 SchedulerOutput
+
+**new_reqs_data**：NewRequestData.from_request()，包含 prompt token ids、block ids、sampling params 等完整信息（首次调度需要发给 worker 缓存）
+
+**cached_reqs_data**（`_make_cached_request_data()`）：CachedRequestData，只发增量 diff（新 token ids、新 block ids、num_computed_tokens），worker 已有缓存
+
+**SchedulerOutput 字段**：
+
+- num_scheduled_tokens：每个请求本步调度的 token 数
+- total_num_scheduled_tokens：总 token 数
+- scheduled_spec_decode_tokens：spec decode token ids
+- scheduled_encoder_inputs：encoder 输入索引
+- num_common_prefix_blocks：cascade attention 用的公共前缀块数
+- finished_req_ids：上一步到本步之间完成的请求（非本步新完成）
+- preempted_req_ids：本步被 preempt 的请求
+
+**KVConnector / ECConnector**：调用 build_connector_meta() 生成 KV transfer 元数据，附到 output
+
+---
+
+### 4. `_update_after_schedule()`
+
+- 对所有调度到的请求：num_computed_tokens += num_scheduled_tokens（提前推进，使下一步可立即再调度）
+- 更新 is_prefill_chunk 标记
+- 释放已完成的 encoder inputs
+- 清空 self.finished_req_ids（已打包进 output）
+
+---
+### CPAwareScheduler 的覆盖
+
+CPAwareScheduler.schedule() 在 super().schedule() 之后追加：
+- 清空 `_preempted_this_step`（在方法开头）
+- 遍历 num_scheduled_tokens，识别 active CP 请求，填充 cp_rank_to_req_id、req_id_to_cp_size、cp_rank_scheduled_tokens、num_cp_request
+
+之后 post_schedule_cp_sync() 在 engine 层调用，基于实际调度结果做跨 rank 共识，可能回滚部分 CP 请求并修正 output。
