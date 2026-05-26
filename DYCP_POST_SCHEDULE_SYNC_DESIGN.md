@@ -67,7 +67,7 @@ SCHEDULED = 2
 NOT_SCHEDULED = 1
 PREEMPTED = 0
 
-def _post_schedule_cp_sync(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
     """
     在 schedule() 之后同步长请求的调度状态。
     
@@ -76,48 +76,40 @@ def _post_schedule_cp_sync(self, scheduler_output: SchedulerOutput) -> Scheduler
     2. all-reduce MIN：取最差状态
     3. 根据共识结果执行 soft_rollback 或 hard_rollback
     """
-    if not self.active_cp_requests:
-        return scheduler_output
+    if not self.active_cp_requests or self.cp_sync is None:
+        self._preempted_this_step.clear()
+        return output
     
     active_ids = sorted(self.active_cp_requests.keys())
     
     # Step 1: 三态编码
-    self._confirm_tensor.zero_()
-    for i, req_id in enumerate(active_ids):
-        if req_id in scheduler_output.num_scheduled_tokens:
-            self._confirm_tensor[i] = SCHEDULED
+    status: list[int] = []
+    for req_id in active_ids:
+        if req_id in output.num_scheduled_tokens:
+            status.append(SCHEDULED)
         elif req_id in self._preempted_this_step:
-            self._confirm_tensor[i] = PREEMPTED
+            status.append(PREEMPTED)
         else:
-            self._confirm_tensor[i] = NOT_SCHEDULED
+            status.append(NOT_SCHEDULED)
     
     # Step 2: all-reduce MIN — 取所有 rank 中的最差状态
-    torch.distributed.all_reduce(
-        self._confirm_tensor[:len(active_ids)],
-        op=torch.distributed.ReduceOp.MIN,
-        group=self.dp_group,
+    # (委托给 CPSyncProtocol.sync_schedule_confirm)
+    confirmed, soft_rollback_ids, hard_rollback_ids = (
+        self.cp_sync.sync_schedule_confirm(active_ids, status)
     )
     
     # Step 3: 根据共识结果分类处理
-    confirmed_ids = []
-    soft_rollback_ids = []
-    hard_rollback_ids = []
-    for i, req_id in enumerate(active_ids):
-        val = self._confirm_tensor[i].item()
-        if val == SCHEDULED:
-            confirmed_ids.append(req_id)
-        elif val == NOT_SCHEDULED:
-            soft_rollback_ids.append(req_id)
-        else:  # PREEMPTED
-            hard_rollback_ids.append(req_id)
-    
-    # Step 4: 执行回滚
     if soft_rollback_ids:
-        scheduler_output = self._soft_rollback(scheduler_output, soft_rollback_ids)
+        output = self._soft_rollback(output, soft_rollback_ids)
     if hard_rollback_ids:
-        scheduler_output = self._hard_rollback(scheduler_output, hard_rollback_ids)
+        output = self._hard_rollback(output, hard_rollback_ids)
     
-    return scheduler_output
+    self._preempted_this_step.clear()
+    
+    # Step 4: 将确认的 CP 请求 ID 传给 worker，用于计算 batch 中的 indices
+    output.cp_req_ids_sorted = sorted(confirmed) if confirmed else None
+    
+    return output
 ```
 
 `_preempted_this_step` 是一个 set，在 `schedule()` 执行过程中收集被 preempt 的 CP 请求 ID。需要在 `schedule()` 的 preempt 路径中记录：
@@ -140,21 +132,26 @@ def _preempt_request(self, request, ...):
 def _soft_rollback(self, output: SchedulerOutput, rollback_ids: list[str]) -> SchedulerOutput:
     """
     轻量回滚：从 SchedulerOutput 中移除，但不重置 num_computed_tokens。
-    请求留在 running/waiting queue 中，下一步重试。
+    请求放回 waiting queue 头部，下一步重试。
     """
     for req_id in rollback_ids:
         if req_id in output.num_scheduled_tokens:
             # 本 rank 调度了但共识未通过 → 从 output 中移除
             num_tokens = output.num_scheduled_tokens.pop(req_id)
             output.total_num_scheduled_tokens -= num_tokens
-            self._remove_from_output(output, req_id)
-            
-            # 释放本次 schedule() 中新分配的 KV blocks（如果有）
-            # 注意：不释放之前已分配的 blocks，不重置 num_computed_tokens
-            self.kv_cache_manager.free_last_allocation(request)
-        
-        # 不在 output 中的 rank：什么都不用做，请求本来就在 waiting 中
-    
+            self._remove_req_from_output(output, req_id)
+
+            request = self.active_cp_requests[req_id]
+            # 释放本次 schedule() 中分配的 KV blocks
+            self.kv_cache_manager.free(request)
+            # 从 running 移除，状态改回 WAITING
+            request.status = RequestStatus.WAITING
+            if request in self.running:
+                self.running.remove(request)
+            self.waiting.prepend_request(request)
+
+        # 不在 output 中的 rank：请求本来就在 waiting 中，无需处理
+
     return output
 ```
 
@@ -176,23 +173,26 @@ def _hard_rollback(self, output: SchedulerOutput, rollback_ids: list[str]) -> Sc
             # 本 rank 调度了 → 从 output 中移除
             num_tokens = output.num_scheduled_tokens.pop(req_id)
             output.total_num_scheduled_tokens -= num_tokens
-            self._remove_from_output(output, req_id)
-        
+            self._remove_req_from_output(output, req_id)
+
         request = self.active_cp_requests[req_id]
-        
+
         if req_id not in self._preempted_this_step:
             # 本 rank 没有被 schedule() preempt，需要手动执行完整 preempt
             self.kv_cache_manager.free(request)
             request.num_computed_tokens = 0
             request.status = RequestStatus.PREEMPTED
+            if request in self.running:
+                self.running.remove(request)
         # else: schedule() 已经 preempt 过了，num_computed_tokens 已经是 0
-        
-        # 统一放回 waiting queue 头部
-        self.waiting.prepend_request(request)
+
         # 从 active 移回 pending（等待下次 announce 重新激活）
         del self.active_cp_requests[req_id]
         self.pending_cp_requests[req_id] = request
-    
+        # 放回 waiting queue 头部（避免重复添加）
+        if request not in self.waiting:
+            self.waiting.prepend_request(request)
+
     return output
 ```
 
@@ -201,13 +201,24 @@ def _hard_rollback(self, output: SchedulerOutput, rollback_ids: list[str]) -> Sc
 ### 3.5 辅助方法
 
 ```python
-def _remove_from_output(self, output: SchedulerOutput, req_id: str):
+def _remove_req_from_output(self, output: SchedulerOutput, req_id: str) -> None:
     """从 SchedulerOutput 的各个字段中清理指定请求。"""
     output.scheduled_new_reqs = [
         r for r in output.scheduled_new_reqs if r.req_id != req_id
     ]
-    if hasattr(output.scheduled_cached_reqs, 'req_ids'):
-        self._remove_from_cached_reqs(output, req_id)
+    # scheduled_cached_reqs 按 index 移除
+    cached = output.scheduled_cached_reqs
+    if req_id in cached.req_ids:
+        idx = cached.req_ids.index(req_id)
+        cached.req_ids.pop(idx)
+        cached.new_token_ids.pop(idx)
+        cached.new_block_ids.pop(idx)
+        cached.num_computed_tokens.pop(idx)
+        cached.num_output_tokens.pop(idx)
+        cached.resumed_req_ids.discard(req_id)
+        if req_id in cached.all_token_ids:
+            del cached.all_token_ids[req_id]
+    # CP 相关字段
     if output.cp_rank_scheduled_tokens and req_id in output.cp_rank_scheduled_tokens:
         del output.cp_rank_scheduled_tokens[req_id]
     if output.cp_rank_to_req_id and req_id in output.cp_rank_to_req_id:
@@ -215,6 +226,9 @@ def _remove_from_output(self, output: SchedulerOutput, req_id: str):
     if output.req_id_to_cp_size and req_id in output.req_id_to_cp_size:
         del output.req_id_to_cp_size[req_id]
     output.num_cp_request = max(0, output.num_cp_request - 1)
+    # spec decode
+    if output.scheduled_spec_decode_tokens and req_id in output.scheduled_spec_decode_tokens:
+        del output.scheduled_spec_decode_tokens[req_id]
 ```
 
 ### 3.6 Preemption 同步（已整合到三态协议中）
@@ -556,12 +570,13 @@ CP 请求数量通常很少（1-2 个），gather/scatter 的 tensor 很小，�
 
 | 文件 | 改动 |
 |------|------|
-| `vllm/v1/core/sched/cp_sync.py` | 新增 `sync_announce()`；新增 `sync_schedule_confirm()`（三态） |
-| `vllm/v1/core/sched/cp_aware_scheduler.py` | 新增 `post_schedule_cp_sync()`；简化 `run_cp_sync()` 为仅 announce；新增 soft/hard rollback |
-| `vllm/v1/engine/core.py` | 在 `schedule()` 之后调用 `post_schedule_cp_sync()` |
-| `vllm/v1/core/sched/output.py` | 新增 `cp_req_indices` 字段 |
-| `vllm/v1/worker/gpu_model_runner.py` | 去掉 `reorder_batch` 调用；改用 `cp_req_indices` 计算 `dycp_local_seq_lens` |
-| `vllm/v1/attention/backends/flash_attn.py` | 用 index-based gather/scatter 替代基于位置的 CP/非 CP 分支 |
+| `vllm/v1/core/sched/cp_sync.py` | 新增 `sync_announce()`；新增 `sync_schedule_confirm()`（三态，返回三个列表）；删除 `sync_cp_schedule()` |
+| `vllm/v1/core/sched/cp_aware_scheduler.py` | 新增 `post_schedule_cp_sync()`；简化 `run_cp_sync()` 为仅 announce；新增 `_soft_rollback()`/`_hard_rollback()`/`_remove_req_from_output()`；覆盖 `_preempt_request()` 追踪 CP preempt；删除 `_sync_cp_preemption()` 和 `_preempt_cp_request()` |
+| `vllm/v1/engine/core.py` | 在 `step()` 和 `step_with_batch_queue()` 的 `schedule()` 之后调用 `post_schedule_cp_sync()` |
+| `vllm/v1/core/sched/output.py` | 新增 `cp_req_ids_sorted: list[str] \| None` 字段（worker 用来计算 batch indices） |
+| `vllm/v1/worker/gpu_model_runner.py` | 去掉 `reorder_batch` 调用；新增 `_compute_cp_req_indices()`；`_build_attention_metadata` 改用 `cp_req_indices` 参数；改用 index-based scatter 计算 `dycp_local_seq_lens` |
+| `vllm/v1/attention/backend.py` | `CommonAttentionMetadata` 新增 `cp_req_indices`、`dycp_local_seq_lens`/`dycp_local_seq_lens_cpu` 字段；`num_dycp_reqs` 改为 property |
+| `vllm/v1/attention/backends/flash_attn.py` | `FlashAttentionMetadata` 新增 `cp_req_indices`；`build()` 透传该字段；`forward()` 新增 DYCP 分支调用 `_forward_with_dycp()`（stub） |
 | `vllm/v1/attention/backends/utils.py` | 删除 `reorder_batch_to_split_cp_and_normal` |
 | `vllm/v1/worker/gpu_input_batch.py` | 删除 `apply_permutation`（仅用于 reorder 的情况） |
 | `vllm/v1/worker/block_table.py` | 删除 `apply_permutation`（仅用于 reorder 的情况） |
@@ -574,11 +589,15 @@ class CPSyncProtocol:
     def sync_announce(self, pending_ids: list[str]) -> list[str]:
         """仅 announce 阶段，返回所有 rank 都收到的请求 ID。"""
         ...
-    
-    def sync_schedule_confirm(self, active_ids: list[str], scheduled: list[bool]) -> list[str]:
-        """后置确认，返回所有 rank 都调度了的请求 ID。"""
+
+    def sync_schedule_confirm(
+        self,
+        active_ids: list[str],
+        status: list[int],  # SCHEDULED=2 / NOT_SCHEDULED=1 / PREEMPTED=0
+    ) -> tuple[list[str], list[str], list[str]]:
+        """后置确认，返回 (confirmed_ids, soft_rollback_ids, hard_rollback_ids)。"""
         ...
-    
+
     def sync_preemption(self, active_ids: list[str], needs_preempt: list[bool]) -> list[str]:
         """Preemption 同步（保持不变）。"""
         ...
@@ -588,9 +607,17 @@ class CPAwareScheduler:
     def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
         """schedule() 之后的后置同步。"""
         ...
-    
-    def _rollback_cp_requests(self, output: SchedulerOutput, rollback_ids: list[str]) -> SchedulerOutput:
-        """回滚未通过共识的请求。"""
+
+    def _soft_rollback(self, output: SchedulerOutput, rollback_ids: list[str]) -> SchedulerOutput:
+        """轻量回滚：移出 output，不重置 num_computed_tokens。"""
+        ...
+
+    def _hard_rollback(self, output: SchedulerOutput, rollback_ids: list[str]) -> SchedulerOutput:
+        """完整回滚：所有 rank 统一 preempt，重置 num_computed_tokens=0。"""
+        ...
+
+    def _remove_req_from_output(self, output: SchedulerOutput, req_id: str) -> None:
+        """从 SchedulerOutput 各字段中清理指定请求。"""
         ...
 ```
 
@@ -761,8 +788,10 @@ schedule()
 ---
 ### CPAwareScheduler 的覆盖
 
-CPAwareScheduler.schedule() 在 super().schedule() 之后追加：
-- 清空 `_preempted_this_step`（在方法开头）
-- 遍历 num_scheduled_tokens，识别 active CP 请求，填充 cp_rank_to_req_id、req_id_to_cp_size、cp_rank_scheduled_tokens、num_cp_request
+`CPAwareScheduler.schedule()` 在 `super().schedule()` 前后各有处理：
+- **开头**：清空 `_preempted_this_step`
+- **结尾**：遍历 `num_scheduled_tokens`，识别 active CP 请求，填充 `cp_rank_to_req_id`、`req_id_to_cp_size`、`cp_rank_scheduled_tokens`、`num_cp_request`
 
-之后 post_schedule_cp_sync() 在 engine 层调用，基于实际调度结果做跨 rank 共识，可能回滚部分 CP 请求并修正 output。
+`_preempt_request()` 被覆盖，在父类逻辑之前记录被 preempt 的 CP 请求 ID 到 `_preempted_this_step`。
+
+之后 `post_schedule_cp_sync()` 在 engine 层调用（`step()` 和 `step_with_batch_queue()` 两处），基于实际调度结果做跨 rank 共识，可能回滚部分 CP 请求并修正 output，最终将确认的 CP 请求 ID 写入 `output.cp_req_ids_sorted` 传给 worker。
