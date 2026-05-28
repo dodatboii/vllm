@@ -4,7 +4,13 @@
 
 Extends the existing Scheduler with CP awareness while preserving the
 per-DP independent process architecture. CP requests are coordinated
-via CPSyncProtocol rather than a centralized CrossDPScheduler.
+via CPSyncProtocol.
+
+Design rationale: the client layer (DPEngineCoreClient) broadcasts CP requests
+to ALL DP ranks before they reach the scheduler, so every rank is guaranteed to
+hold the same CP request. No pre-schedule announce/vote phase is needed.
+Coordination is a single post-schedule all-reduce MIN that agrees on whether
+each rank successfully scheduled each CP request in the current step.
 """
 from __future__ import annotations
 
@@ -41,9 +47,11 @@ class CPAwareScheduler(Scheduler):
 
     Key differences from base Scheduler:
     - Classifies requests as long (CP) or short (DP) based on token threshold
-    - CP requests enter a pending state until all DPs confirm readiness
+    - CP requests are activated immediately on arrival (client guarantees
+      broadcast to all ranks, so no announce phase is needed)
     - Only allocates local portion of KV cache for CP requests
     - Adds CP metadata to SchedulerOutput
+    - Post-schedule all-reduce MIN agrees on confirmed/rollback decisions
     """
 
     def __init__(
@@ -76,8 +84,8 @@ class CPAwareScheduler(Scheduler):
         )
         self.max_cp_requests = vllm_config.scheduler_config.num_cp_seqs
 
-        # CP request state management.
-        self.pending_cp_requests: dict[str, Request] = {}
+        # Active CP requests: request_id -> Request.
+        # CP requests are added here immediately on arrival; no pending state.
         self.active_cp_requests: dict[str, Request] = {}
 
         # Tracks CP requests preempted by schedule() in the current step.
@@ -90,7 +98,6 @@ class CPAwareScheduler(Scheduler):
                 dp_group=dp_group,
                 cp_world_size=self.cp_world_size,
                 cp_rank=self.cp_rank,
-                sync_interval=4,
             )
 
     # ------------------------------------------------------------------
@@ -113,61 +120,23 @@ class CPAwareScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def add_request(self, request: Request) -> None:
-        """Add request, routing to pending_cp or normal waiting queue."""
+        """Add request, routing CP requests directly to active state."""
         if self.cp_world_size <= 1 or not self._is_long_request(request):
             request.cp_ranks = [self.cp_rank]
             super().add_request(request)
         else:
+            # Client guarantees CP requests are broadcast to all ranks, so
+            # activate immediately without a pending/announce phase.
             request.cp_ranks = list(range(self.cp_world_size))
-            self.pending_cp_requests[request.request_id] = request
+            self.active_cp_requests[request.request_id] = request
             self.requests[request.request_id] = request
+            self.waiting.add_request(request)
             logger.debug(
-                "CP request %s added to pending (tokens=%d, rank=%d)",
+                "CP request %s activated on rank %d (tokens=%d)",
                 request.request_id,
-                request.num_tokens,
                 self.cp_rank,
+                request.num_tokens,
             )
-
-    def has_pending_cp_requests(self) -> bool:
-        """Check if there are CP requests waiting for sync."""
-        return len(self.pending_cp_requests) > 0
-
-    def get_num_unfinished_requests(self) -> int:
-        return (
-            super().get_num_unfinished_requests()
-            + len(self.pending_cp_requests)
-        )
-
-    # ------------------------------------------------------------------
-    # CP Sync: activate pending CP requests via distributed consensus
-    # ------------------------------------------------------------------
-
-    def run_cp_sync(self) -> None:
-        """Execute CP sync: announce pending requests to all ranks.
-
-        Called from DPEngineCoreProc busy loop at sync intervals.
-        """
-        if self.cp_sync is None or not self.pending_cp_requests:
-            return
-
-        # Sort to guarantee identical slot-to-request mapping across all ranks.
-        pending_ids = sorted(self.pending_cp_requests.keys())
-        announced_ids = self.cp_sync.sync_announce(pending_ids)
-
-        for req_id in announced_ids:
-            self._activate_cp_request(req_id)
-
-    def _activate_cp_request(self, request_id: str) -> None:
-        """Move a CP request from pending to active (running queue)."""
-        request = self.pending_cp_requests.pop(request_id)
-        self.active_cp_requests[request_id] = request
-        # Add to the normal waiting queue so schedule() picks it up.
-        self.waiting.add_request(request)
-        logger.debug(
-            "CP request %s activated on rank %d",
-            request_id,
-            self.cp_rank,
-        )
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Override to track CP requests preempted by schedule()."""
@@ -289,8 +258,7 @@ class CPAwareScheduler(Scheduler):
                 if request in self.running:
                     self.running.remove(request)
 
-            del self.active_cp_requests[req_id]
-            self.pending_cp_requests[req_id] = request
+            # Keep in active_cp_requests; re-queue for the next step.
             if request not in self.waiting:
                 self.waiting.prepend_request(request)
 
