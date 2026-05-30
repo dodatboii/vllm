@@ -609,14 +609,12 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def execute_model(
-        self, scheduler_outputs: "SchedulerOutput | list[SchedulerOutput | None]"
+        self, scheduler_outputs: "SchedulerOutput"
     ) -> ModelRunnerOutput | None:
-        if isinstance(scheduler_outputs, list):
-            scheduler_output = scheduler_outputs[self.model_runner.cp_rank]
-            if scheduler_output.total_num_scheduled_tokens == 0 and not scheduler_output.none_tokens_in_peer_sched:
-                self.model_runner._dummy_run(1, uniform_decode=True)
-        else:
-            scheduler_output = scheduler_outputs
+        scheduler_output = scheduler_outputs
+        if (scheduler_output.total_num_scheduled_tokens == 0
+                and scheduler_output.none_tokens_in_peer_sched):
+            self.model_runner._dummy_run(1, uniform_decode=True)
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens

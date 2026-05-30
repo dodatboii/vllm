@@ -216,6 +216,11 @@ class CPAwareScheduler(Scheduler):
         else:
             output.cp_req_ids_sorted = None
 
+        # If this rank has no tokens to execute but peer ranks do have CP
+        # tokens, signal workers to run a dummy forward pass for collective ops.
+        if output.total_num_scheduled_tokens == 0 and confirmed:
+            output.none_tokens_in_peer_sched = True
+
         return output
 
     def _soft_rollback(
