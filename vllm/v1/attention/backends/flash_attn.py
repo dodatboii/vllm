@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 if is_flash_attn_varlen_func_available():
@@ -34,7 +34,7 @@ if is_flash_attn_varlen_func_available():
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dycp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -213,6 +213,9 @@ class FlashAttentionMetadata:
 
     # For DYCP: indices of CP requests in the batch (request dimension).
     cp_req_indices: list[int] | None = None
+    # For DYCP: per-request local KV lengths (full seq_len for non-CP,
+    # local portion for CP requests).
+    dycp_local_seq_lens: torch.Tensor | None = None
 
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
@@ -294,14 +297,19 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.aot_schedule = get_flash_attn_version() == 3
 
         try:
-            from vllm.distributed.parallel_state import get_dcp_group
-
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+
+        try:
+            self.dycp_world_size = get_dycp_group().world_size
+            self.dycp_rank = get_dycp_group().rank_in_group
+        except AssertionError:
+            self.dycp_world_size = 1
+            self.dycp_rank = 0
 
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
@@ -503,6 +511,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
             cp_req_indices=common_attn_metadata.cp_req_indices,
+            dycp_local_seq_lens=common_attn_metadata.dycp_local_seq_lens,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -911,22 +920,141 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> None:
         """Forward pass for batches containing DYCP (dynamic CP) requests.
 
-        CP requests are identified by attn_metadata.cp_req_indices.
-        The batch may contain a mix of CP and non-CP requests.
-
-        Implementation plan:
-        1. Convert cp_req_indices (request-level) to token ranges using
-           query_start_loc, producing cp_token_idx and non_cp_token_idx.
-        2. CP tokens: gather queries across DYCP ranks, run cross-rank
-           flash_attn_varlen_func with dycp_local_seq_lens as seqused_k,
-           then reduce via cp_lse_ag_out_rs and scatter back.
-        3. Non-CP tokens: run normal flash_attn_varlen_func in-place.
+        CP requests use cross-rank attention (all_gather + flash_attn +
+        cp_lse_ag_out_rs). Non-CP requests use standard causal attention.
         """
-        raise NotImplementedError(
-            "_forward_with_dycp is not yet implemented. "
-            "This stub wires up the dispatch path; the actual cross-rank "
-            "attention logic will be added in a follow-up."
+        assert attn_metadata.cp_req_indices is not None
+        assert attn_metadata.dycp_local_seq_lens is not None
+
+        cp_req_indices = attn_metadata.cp_req_indices
+        query_start_loc = attn_metadata.query_start_loc  # [num_reqs + 1]
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
         )
+
+        # --- Step 1: compute CP and non-CP token indices ---
+        cp_token_idx_list: list[int] = []
+        for req_idx in cp_req_indices:
+            start = query_start_loc[req_idx].item()
+            end = query_start_loc[req_idx + 1].item()
+            cp_token_idx_list.extend(range(start, end))
+
+        num_actual_tokens = query.shape[0]
+        all_token_idx = set(range(num_actual_tokens))
+        cp_token_set = set(cp_token_idx_list)
+        non_cp_token_idx_list = sorted(all_token_idx - cp_token_set)
+
+        cp_token_idx = torch.tensor(
+            cp_token_idx_list, dtype=torch.long, device=query.device
+        )
+        non_cp_token_idx = torch.tensor(
+            non_cp_token_idx_list, dtype=torch.long, device=query.device
+        )
+
+        # --- Step 2: CP tokens — cross-rank attention ---
+        if cp_token_idx.numel() > 0:
+            cp_query = query[cp_token_idx].contiguous()  # [T_cp, H, D]
+
+            # Build cu_seqlens_q for CP requests only
+            cp_req_tensor = torch.tensor(
+                cp_req_indices, dtype=torch.long, device=query.device
+            )
+            cp_query_lens = (
+                query_start_loc[cp_req_tensor + 1] - query_start_loc[cp_req_tensor]
+            )
+            cp_cu_seqlens_q = torch.zeros(
+                len(cp_req_indices) + 1, dtype=torch.int32, device=query.device
+            )
+            cp_cu_seqlens_q[1:] = cp_query_lens.cumsum(0).to(torch.int32)
+            cp_max_seqlen_q = int(cp_query_lens.max().item())
+
+            # seqused_k: local KV lengths for CP requests
+            cp_seqused_k = attn_metadata.dycp_local_seq_lens[cp_req_tensor]
+            cp_max_seqlen_k = int(cp_seqused_k.max().item())
+
+            # block_table rows for CP requests
+            cp_block_table = attn_metadata.block_table[cp_req_tensor]
+
+            # Each rank attends to its local KV partition with the full query.
+            cp_attn_out, cp_lse = flash_attn_varlen_func(
+                q=cp_query,
+                k=key_cache,
+                v=value_cache,
+                out=None,
+                cu_seqlens_q=cp_cu_seqlens_q,
+                max_seqlen_q=cp_max_seqlen_q,
+                seqused_k=cp_seqused_k,
+                max_seqlen_k=cp_max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=False,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=cp_block_table,
+                softcap=self.logits_soft_cap,
+                return_softmax_lse=True,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            # FA returns LSE as [H, T_cp]; cp_lse_ag_out_ar expects [T_cp, H].
+            # Use all_reduce (not reduce_scatter): DYCP does not shard heads,
+            # so every rank needs the full [T_cp, H, D] result.
+            cp_final = cp_lse_ag_out_ar(
+                cp_attn_out,
+                cp_lse.transpose(0, 1),
+                get_dycp_group(),
+            )
+            output[cp_token_idx] = cp_final
+
+        # --- Step 3: non-CP tokens — standard causal attention ---
+        if non_cp_token_idx.numel() > 0:
+            # Identify which request indices are non-CP
+            cp_req_set_tensor = torch.tensor(
+                cp_req_indices, dtype=torch.long, device=query.device
+            )
+            num_reqs = query_start_loc.shape[0] - 1
+            all_req_mask = torch.ones(num_reqs, dtype=torch.bool, device=query.device)
+            all_req_mask[cp_req_set_tensor] = False
+            non_cp_req_indices = torch.where(all_req_mask)[0]
+
+            non_cp_query_lens = (
+                query_start_loc[non_cp_req_indices + 1]
+                - query_start_loc[non_cp_req_indices]
+            )
+            non_cp_cu_seqlens_q = torch.zeros(
+                non_cp_req_indices.shape[0] + 1,
+                dtype=torch.int32,
+                device=query.device,
+            )
+            non_cp_cu_seqlens_q[1:] = non_cp_query_lens.cumsum(0).to(torch.int32)
+            non_cp_max_seqlen_q = int(non_cp_query_lens.max().item())
+
+            non_cp_seqused_k = attn_metadata.seq_lens[non_cp_req_indices]
+            non_cp_max_seqlen_k = int(non_cp_seqused_k.max().item())
+            non_cp_block_table = attn_metadata.block_table[non_cp_req_indices]
+
+            non_cp_out = flash_attn_varlen_func(
+                q=query[non_cp_token_idx],
+                k=key_cache,
+                v=value_cache,
+                out=None,
+                cu_seqlens_q=non_cp_cu_seqlens_q,
+                max_seqlen_q=non_cp_max_seqlen_q,
+                seqused_k=non_cp_seqused_k,
+                max_seqlen_k=non_cp_max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=non_cp_block_table,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
+            output[non_cp_token_idx] = non_cp_out
 
     def _forward_encoder_attention(
         self,
