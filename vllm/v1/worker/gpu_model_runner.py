@@ -1583,7 +1583,10 @@ class GPUModelRunner(
                 output_idx += num_sched
 
         if self.cp_world_size > 1:
-            self.input_batch.block_table.compute_domain_slot_mapping(req_indices, positions_np, scheduler_output.num_cp_request)
+            cp_req_indices = self._compute_cp_req_indices(scheduler_output) or []
+            self.input_batch.block_table.compute_slot_mapping_with_dycp(
+                req_indices, positions_np, cp_req_indices
+            )
         else:
             self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
