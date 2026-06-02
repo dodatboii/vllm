@@ -12,6 +12,7 @@ DYCP 混合请求测试脚本
 
 import argparse
 import asyncio
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -106,31 +107,37 @@ async def run(
 
     tasks = []
     async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
-        # 长请求
+        entries = []
         for i in range(num_long):
-            prompt = make_long_prompt(long_prompt_tokens)
-            tasks.append(
-                send_request(
-                    session, api_url, model,
-                    req_id=f"long-{i}",
-                    kind="long",
-                    prompt=prompt,
-                    max_tokens=long_max_tokens,
-                    prompt_tokens=long_prompt_tokens,
-                )
-            )
-        # 短请求
+            entries.append(("long", i))
         for i in range(num_short):
-            tasks.append(
-                send_request(
-                    session, api_url, model,
-                    req_id=f"short-{i}",
-                    kind="short",
-                    prompt=make_short_prompt(),
-                    max_tokens=short_max_tokens,
-                    prompt_tokens=20,
+            entries.append(("short", i))
+        random.shuffle(entries)
+
+        for kind, i in entries:
+            if kind == "long":
+                prompt = make_long_prompt(long_prompt_tokens)
+                tasks.append(
+                    send_request(
+                        session, api_url, model,
+                        req_id=f"long-{i}",
+                        kind="long",
+                        prompt=prompt,
+                        max_tokens=long_max_tokens,
+                        prompt_tokens=long_prompt_tokens,
+                    )
                 )
-            )
+            else:
+                tasks.append(
+                    send_request(
+                        session, api_url, model,
+                        req_id=f"short-{i}",
+                        kind="short",
+                        prompt=make_short_prompt(),
+                        max_tokens=short_max_tokens,
+                        prompt_tokens=20,
+                    )
+                )
 
         print(f"发送 {num_long} 个长请求（~{long_prompt_tokens} tokens）"
               f" + {num_short} 个短请求，并发执行...\n")
