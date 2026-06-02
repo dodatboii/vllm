@@ -488,12 +488,6 @@ class EngineCore:
             )
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
-        else:
-            # No local requests, but CP sync all_reduce must still participate
-            # so peer ranks with active CP requests are not blocked.
-            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
-                from vllm.v1.core.sched.output import SchedulerOutput
-                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
@@ -525,7 +519,14 @@ class EngineCore:
                     # or there are no more requests to schedule.
                     return None, True
 
-        elif not batch_queue:
+        else:
+            # No local requests, but CP sync all_reduce must still participate
+            # so peer ranks with active CP requests are not blocked.
+            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+                from vllm.v1.core.sched.output import SchedulerOutput
+                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
+
+        if not batch_queue:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
