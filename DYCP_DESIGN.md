@@ -180,8 +180,16 @@ min == PREEMPTED (0)  → hard rollback：有 rank 被 preempt，所有 rank 统
 
 在 `schedule()` 之后、`execute_model()` 之前调用，修正 SchedulerOutput 使所有 rank 对 CP 请求的调度状态一致。
 
+**关键约束**：即使本 rank 没有活跃 CP 请求，也必须调用 `cp_sync.sync_empty()` 参与 all_reduce，否则持有 CP 请求的 peer rank 会在集合通信上永久阻塞。`sync_empty()` 用 `NOT_SCHEDULED(1)` 填充张量——若填 `0(PREEMPTED)`，MIN 操作会将 peer 的 `SCHEDULED(2)` 拉低到 `0`，触发不必要的 hard_rollback。
+
 ```python
 def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
+    if cp_sync is None:
+        return output
+    if not active_cp_requests:
+        cp_sync.sync_empty()   # 必须参与，不能跳过
+        return output
+
     active_ids = sorted(self.active_cp_requests.keys())
 
     # 三态编码
@@ -227,27 +235,24 @@ def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
 
 ### 5.5 DPEngineCoreProc（`vllm/v1/engine/core.py`）
 
-busy loop 结构：
+**Scheduler 自动选择**：`SchedulerConfig.get_scheduler_cls()` 在 `num_cp_seqs > 0` 时自动返回 `CPAwareScheduler`，无需手动指定 `--scheduler-cls`。
+
+`post_schedule_cp_sync` 在 `step()` 的 `schedule()` 和 `execute_model()` 之间调用。**关键**：`has_requests()=False` 时不能直接返回，必须先调用一次 `post_schedule_cp_sync`（传入空 output），否则 peer rank 死锁：
 
 ```python
-def run_busy_loop(self):
-    while True:
-        self._process_input_queue()
-        executed = self._process_engine_step()
-        ...
+def step(self):
+    if not self.scheduler.has_requests():
+        if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+            self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
+        return {}, False
+    scheduler_output = self.scheduler.schedule()
+    if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+        scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
+    model_output = self.model_executor.execute_model(scheduler_output)
+    ...
 ```
 
-`post_schedule_cp_sync` 在 `step()` 内部的 `schedule()` 和 `execute_model()` 之间调用：
-
-```python
-# engine/core.py — EngineCore.step()
-scheduler_output = self.scheduler.schedule()
-
-if hasattr(self.scheduler, 'post_schedule_cp_sync'):
-    scheduler_output = self.scheduler.post_schedule_cp_sync(scheduler_output)
-
-model_output = self.model_executor.execute_model(scheduler_output)
-```
+`step_with_batch_queue()` 的 `has_requests()=False` 分支同样处理。`hasattr` 检查保证向后兼容。
 
 ---
 
@@ -364,12 +369,12 @@ Attention backend 需要根据 `cp_req_indices` 区分 CP 请求和非 CP 请求
 
 ## 8. 通信开销
 
-| 场景 | 每步 all-reduce 次数 |
-|------|---------------------|
-| 无 CP 请求（`active_cp_requests` 为空） | 0 |
-| 有 active CP 请求 | 1（post-schedule confirm） |
+| 场景 | 每步 all_reduce 次数 | 说明 |
+|------|---------------------|------|
+| 无 CP 请求（`active_cp_requests` 为空） | 1（`sync_empty`） | 必须参与以避免 peer rank 阻塞 |
+| 有 active CP 请求 | 1（`sync_schedule_confirm`） | post-schedule 共识 |
 
-all-reduce 操作在 CPU 上执行（gloo backend），tensor 大小为 `min(num_active_cp, 32)` 个 int32，单次开销微秒级，相对于长序列 prefill/decode 的毫秒级计算可忽略。
+all_reduce 在 CPU 上执行（gloo backend），tensor 固定为 `MAX_CP_SYNC_SLOTS = 32` 个 int32，单次开销微秒级。`sync_empty` 和 `sync_schedule_confirm` 使用相同的张量大小，确保集合通信形状匹配。
 
 ---
 
@@ -387,12 +392,12 @@ all-reduce 操作在 CPU 上执行（gloo backend），tensor 大小为 `min(num
 | 文件 | 改动说明 |
 |------|---------|
 | `vllm/config/parallel.py` | 新增 `dycp_size` 字段 |
-| `vllm/config/scheduler.py` | 新增 `num_cp_seqs`、`long_request_threshold` 字段 |
+| `vllm/config/scheduler.py` | 新增 `num_cp_seqs`、`long_request_threshold` 字段；`get_scheduler_cls()` 在 `num_cp_seqs > 0` 时自动选择 `CPAwareScheduler` |
 | `vllm/engine/arg_utils.py` | 新增 CLI 参数；`max_num_batched_tokens *= dycp_size` |
 | `vllm/distributed/parallel_state.py` | 初始化 `_DYCP` 进程组 |
 | `vllm/forward_context.py` | `BatchDescriptor` 新增 `num_dycp_reqs` 字段 |
 | `vllm/v1/core/sched/output.py` | `SchedulerOutput` 新增 CP 元数据字段（含 `cp_req_ids_sorted`） |
-| `vllm/v1/engine/core.py` | `step()` 中在 `schedule()` 后调用 `post_schedule_cp_sync()` |
+| `vllm/v1/engine/core.py` | `step()` 和 `step_with_batch_queue()` 中在 `schedule()` 后调用 `post_schedule_cp_sync()`；`has_requests()=False` 路径也参与 CP sync |
 | `vllm/v1/engine/core_client.py` | `DPLBAsyncMPClient` CP 广播路由、abort 逻辑 |
 | `vllm/v1/worker/gpu_model_runner.py` | CP rank 初始化；index-based `dycp_local_seq_lens`；cudagraph key 扩展 |
 | `vllm/v1/worker/gpu_worker.py` | `execute_model`/`sample_tokens` 支持列表输入 |

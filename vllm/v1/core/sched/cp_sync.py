@@ -91,7 +91,7 @@ class CPSyncProtocol:
             self._confirm_tensor[i] = status[i]
 
         torch.distributed.all_reduce(
-            self._confirm_tensor[:num_slots],
+            self._confirm_tensor,
             op=torch.distributed.ReduceOp.MIN,
             group=self.dp_group,
         )
@@ -119,3 +119,21 @@ class CPSyncProtocol:
             )
 
         return confirmed, soft_rollback, hard_rollback
+
+    def sync_empty(self) -> None:
+        """Participate in the sync all_reduce with no active CP requests.
+
+        Called by ranks that have no active CP requests in a given step so
+        that peer ranks which do have active requests are not blocked waiting
+        for all participants in the collective operation.
+
+        Fills the tensor with NOT_SCHEDULED (1) so that the MIN operation does
+        not drive any active slot down to PREEMPTED (0), which would trigger
+        spurious hard-rollbacks on the peer ranks.
+        """
+        self._confirm_tensor.fill_(NOT_SCHEDULED)
+        torch.distributed.all_reduce(
+            self._confirm_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.dp_group,
+        )

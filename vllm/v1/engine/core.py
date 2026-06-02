@@ -407,6 +407,13 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            # Even with no local requests, CP sync all_reduce must still
+            # execute so that peer ranks with active CP requests are not
+            # blocked waiting for this rank to participate.
+            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+                from vllm.v1.core.sched.output import SchedulerOutput
+                self.scheduler.post_schedule_cp_sync(
+                    SchedulerOutput.make_empty())
             return {}, False
         scheduler_output = self.scheduler.schedule()
         if hasattr(self.scheduler, 'post_schedule_cp_sync'):
@@ -481,6 +488,12 @@ class EngineCore:
             )
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+        else:
+            # No local requests, but CP sync all_reduce must still participate
+            # so peer ranks with active CP requests are not blocked.
+            if hasattr(self.scheduler, 'post_schedule_cp_sync'):
+                from vllm.v1.core.sched.output import SchedulerOutput
+                self.scheduler.post_schedule_cp_sync(SchedulerOutput.make_empty())
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).

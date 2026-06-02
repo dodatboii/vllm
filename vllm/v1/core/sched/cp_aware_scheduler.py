@@ -184,7 +184,14 @@ class CPAwareScheduler(Scheduler):
 
     def post_schedule_cp_sync(self, output: SchedulerOutput) -> SchedulerOutput:
         """Post-schedule sync: consensus on actual scheduling results."""
-        if not self.active_cp_requests or self.cp_sync is None:
+        if self.cp_sync is None:
+            self._preempted_this_step.clear()
+            return output
+
+        # Always participate in the all_reduce even when this rank has no active
+        # CP requests, so peer ranks with active CP requests are not blocked.
+        if not self.active_cp_requests:
+            self.cp_sync.sync_empty()
             self._preempted_this_step.clear()
             return output
 
