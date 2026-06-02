@@ -161,6 +161,12 @@ class SchedulerConfig:
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
+            if self.num_cp_seqs > 0:
+                from vllm.v1.core.sched.cp_aware_scheduler import (
+                    CPAwareScheduler,
+                )
+
+                return CPAwareScheduler
             if self.async_scheduling:
                 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 
