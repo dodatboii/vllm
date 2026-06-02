@@ -248,6 +248,13 @@ class CPAwareScheduler(Scheduler):
                     self.running.remove(request)
                 self.waiting.prepend_request(request)
 
+            # Remove from prev_step_scheduled_req_ids so that next step
+            # treats this request as freshly resumed rather than continuing
+            # from a previous scheduled step. Without this, the base
+            # scheduler's assert not scheduled_in_prev_step fires when the
+            # request surfaces from waiting into scheduled_resumed_reqs.
+            self.prev_step_scheduled_req_ids.discard(req_id)
+
         return output
 
     def _hard_rollback(
@@ -273,6 +280,12 @@ class CPAwareScheduler(Scheduler):
             # Keep in active_cp_requests; re-queue for the next step.
             if request not in self.waiting:
                 self.waiting.prepend_request(request)
+
+            # Remove from prev_step_scheduled_req_ids so that next step
+            # does not treat this request as continuing from a previous
+            # scheduled step, which would trigger assert failures in the
+            # base scheduler's _make_cached_request_data.
+            self.prev_step_scheduled_req_ids.discard(req_id)
 
         return output
 
