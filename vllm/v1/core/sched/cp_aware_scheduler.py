@@ -272,10 +272,16 @@ class CPAwareScheduler(Scheduler):
             if req_id not in self._preempted_this_step:
                 # schedule() did not preempt this rank; do it manually.
                 self.kv_cache_manager.free(request)
-                request.num_computed_tokens = 0
-                request.status = RequestStatus.PREEMPTED
                 if request in self.running:
                     self.running.remove(request)
+
+            request.num_computed_tokens = 0
+            # Use WAITING (not PREEMPTED) regardless of whether schedule()
+            # already preempted this rank. CP rollbacks always happen before
+            # execute_model, so the worker has never seen this request's KV
+            # state. PREEMPTED would tell the base scheduler to send this as
+            # a resumed request, causing a KeyError in the model runner.
+            request.status = RequestStatus.WAITING
 
             # Keep in active_cp_requests; re-queue for the next step.
             if request not in self.waiting:
