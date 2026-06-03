@@ -233,7 +233,7 @@ class CPAwareScheduler(Scheduler):
     def _soft_rollback(
         self, output: SchedulerOutput, rollback_ids: list[str]
     ) -> SchedulerOutput:
-        """Remove from output without resetting num_computed_tokens."""
+        """Remove from output and requeue for next step."""
         for req_id in rollback_ids:
             if req_id in output.num_scheduled_tokens:
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
@@ -244,6 +244,17 @@ class CPAwareScheduler(Scheduler):
                 self.kv_cache_manager.free(request)
 
                 request.status = RequestStatus.WAITING
+                # Must reset to 0 even though the intent of soft rollback is to
+                # preserve prefill progress. kv_cache_manager.free() releases
+                # all blocks for this request. If num_computed_tokens were left
+                # at its historical value (e.g. 50K), the base scheduler would
+                # take the `else` branch (the KVTransfer path) on the next step
+                # and use that stale value directly, yielding num_new_tokens=0
+                # and hitting `assert num_new_tokens > 0`. Resetting to 0 forces
+                # the base scheduler to call get_computed_blocks() instead, which
+                # re-hits the prefix cache and recovers the same progress without
+                # redundant computation.
+                request.num_computed_tokens = 0
                 if request in self.running:
                     self.running.remove(request)
                 self.waiting.prepend_request(request)
