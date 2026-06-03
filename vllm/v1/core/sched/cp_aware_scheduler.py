@@ -307,7 +307,8 @@ class CPAwareScheduler(Scheduler):
         if req_id in cached.req_ids:
             idx = cached.req_ids.index(req_id)
             cached.req_ids.pop(idx)
-            cached.new_token_ids.pop(idx)
+            if cached.new_token_ids:
+                cached.new_token_ids.pop(idx)
             cached.new_block_ids.pop(idx)
             cached.num_computed_tokens.pop(idx)
             cached.num_output_tokens.pop(idx)
