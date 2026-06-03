@@ -235,6 +235,14 @@ class CPAwareScheduler(Scheduler):
     ) -> SchedulerOutput:
         """Remove from output and requeue for next step."""
         for req_id in rollback_ids:
+            # If the request has already finished on this rank (peer completed
+            # one step earlier and update_from_output cleaned self.requests),
+            # skip the rollback mechanics and just drop it from active tracking.
+            if req_id not in self.requests:
+                self.active_cp_requests.pop(req_id, None)
+                self.prev_step_scheduled_req_ids.discard(req_id)
+                continue
+
             if req_id in output.num_scheduled_tokens:
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
                 output.total_num_scheduled_tokens -= num_tokens
@@ -273,6 +281,12 @@ class CPAwareScheduler(Scheduler):
     ) -> SchedulerOutput:
         """Full rollback: all ranks preempt, reset num_computed_tokens=0."""
         for req_id in rollback_ids:
+            # Same as _soft_rollback: skip and clean up if already finished.
+            if req_id not in self.requests:
+                self.active_cp_requests.pop(req_id, None)
+                self.prev_step_scheduled_req_ids.discard(req_id)
+                continue
+
             if req_id in output.num_scheduled_tokens:
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
                 output.total_num_scheduled_tokens -= num_tokens
