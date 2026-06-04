@@ -395,6 +395,11 @@ class CPAwareScheduler(Scheduler):
             if req_id not in self.requests
         ]
         for req_id in finished_cp:
+            logger.info(
+                "[Debug] CP request %s finished on rank %d,"
+                " removing from active_cp_requests",
+                req_id, self.cp_rank,
+            )
             del self.active_cp_requests[req_id]
 
         return result
