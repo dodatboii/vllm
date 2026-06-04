@@ -286,9 +286,11 @@ class CPAwareScheduler(Scheduler):
             else:
                 logger.info(
                     "[Debug] Soft rollback req=%s (was NOT_SCHEDULED on this"
-                    " rank, num_computed=%d)",
+                    " rank, num_computed=%d, in_running=%s, in_waiting=%s)",
                     req_id[:8],
                     self.active_cp_requests[req_id].num_computed_tokens,
+                    self.active_cp_requests[req_id] in self.running,
+                    self.active_cp_requests[req_id] in self.waiting,
                 )
 
             # Remove from prev_step_scheduled_req_ids so that next step
@@ -395,10 +397,12 @@ class CPAwareScheduler(Scheduler):
             if req_id not in self.requests
         ]
         for req_id in finished_cp:
+            req = self.active_cp_requests[req_id]
             logger.info(
                 "[Debug] CP request %s finished on rank %d,"
-                " removing from active_cp_requests",
+                " num_computed=%d num_output=%d, removing from active_cp_requests",
                 req_id, self.cp_rank,
+                req.num_computed_tokens, req.num_output_tokens,
             )
             del self.active_cp_requests[req_id]
 
