@@ -232,8 +232,14 @@ class CPAwareScheduler(Scheduler):
 
         # Clean up requests that finished on this rank before the sync.
         for req_id in finished_ids:
-            self.active_cp_requests.pop(req_id, None)
+            req = self.active_cp_requests.pop(req_id, None)
             self.prev_step_scheduled_req_ids.discard(req_id)
+            if req is not None:
+                logger.info(
+                    "[Debug] CP request %s removed from active_cp_requests"
+                    " on rank %d (finished, peer notified via SCHEDULED)",
+                    req_id, self.cp_rank,
+                )
 
         if soft_rollback_ids:
             output = self._soft_rollback(output, soft_rollback_ids)
@@ -404,20 +410,10 @@ class CPAwareScheduler(Scheduler):
         """Update scheduler state from model output."""
         result = super().update_from_output(scheduler_output, model_runner_output)
 
-        # Check if any active CP requests have finished.
-        finished_cp = [
-            req_id
-            for req_id in list(self.active_cp_requests.keys())
-            if req_id not in self.requests
-        ]
-        for req_id in finished_cp:
-            req = self.active_cp_requests[req_id]
-            logger.info(
-                "[Debug] CP request %s finished on rank %d,"
-                " num_computed=%d num_output=%d, removing from active_cp_requests",
-                req_id, self.cp_rank,
-                req.num_computed_tokens, req.num_output_tokens,
-            )
-            del self.active_cp_requests[req_id]
+        # Do NOT clean up active_cp_requests here. Removal is handled in
+        # post_schedule_cp_sync once we detect req_id not in self.requests.
+        # Removing here would make active_ids diverge between ranks on the
+        # next step (one rank finishes a step earlier), causing slot mismatches
+        # in the all-reduce and breaking the sync protocol.
 
         return result
