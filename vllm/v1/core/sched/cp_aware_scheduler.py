@@ -198,8 +198,17 @@ class CPAwareScheduler(Scheduler):
         active_ids = sorted(self.active_cp_requests.keys())
 
         status: list[int] = []
+        finished_ids: list[str] = []
         for req_id in active_ids:
-            if req_id in output.num_scheduled_tokens:
+            if req_id not in self.requests:
+                # This rank already finished the request. Report SCHEDULED so
+                # the peer rank is not blocked by a spurious NOT_SCHEDULED/MIN,
+                # allowing it to continue decode independently until it finishes.
+                # Clean up after the sync.
+                s = SCHEDULED
+                s_str = "FINISHED(report SCHEDULED)"
+                finished_ids.append(req_id)
+            elif req_id in output.num_scheduled_tokens:
                 s = SCHEDULED
                 s_str = "SCHEDULED"
             elif req_id in self._preempted_this_step:
@@ -220,6 +229,11 @@ class CPAwareScheduler(Scheduler):
         confirmed, soft_rollback_ids, hard_rollback_ids = (
             self.cp_sync.sync_schedule_confirm(active_ids, status)
         )
+
+        # Clean up requests that finished on this rank before the sync.
+        for req_id in finished_ids:
+            self.active_cp_requests.pop(req_id, None)
+            self.prev_step_scheduled_req_ids.discard(req_id)
 
         if soft_rollback_ids:
             output = self._soft_rollback(output, soft_rollback_ids)
