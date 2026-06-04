@@ -200,11 +200,22 @@ class CPAwareScheduler(Scheduler):
         status: list[int] = []
         for req_id in active_ids:
             if req_id in output.num_scheduled_tokens:
-                status.append(SCHEDULED)
+                s = SCHEDULED
+                s_str = "SCHEDULED"
             elif req_id in self._preempted_this_step:
-                status.append(PREEMPTED)
+                s = PREEMPTED
+                s_str = "PREEMPTED"
             else:
-                status.append(NOT_SCHEDULED)
+                s = NOT_SCHEDULED
+                s_str = "NOT_SCHEDULED"
+            req = self.active_cp_requests[req_id]
+            logger.info(
+                "[Debug] CP sync rank=%d req=%s local_status=%s "
+                "num_computed=%d in_requests=%s",
+                self.cp_rank, req_id[:8], s_str,
+                req.num_computed_tokens, req_id in self.requests,
+            )
+            status.append(s)
 
         confirmed, soft_rollback_ids, hard_rollback_ids = (
             self.cp_sync.sync_schedule_confirm(active_ids, status)
@@ -244,6 +255,12 @@ class CPAwareScheduler(Scheduler):
                 continue
 
             if req_id in output.num_scheduled_tokens:
+                logger.info(
+                    "[Debug] Soft rollback req=%s (was SCHEDULED on this rank,"
+                    " num_computed=%d)",
+                    req_id[:8],
+                    self.active_cp_requests[req_id].num_computed_tokens,
+                )
                 num_tokens = output.num_scheduled_tokens.pop(req_id)
                 output.total_num_scheduled_tokens -= num_tokens
                 self._remove_req_from_output(output, req_id)
@@ -266,6 +283,13 @@ class CPAwareScheduler(Scheduler):
                 if request in self.running:
                     self.running.remove(request)
                 self.waiting.prepend_request(request)
+            else:
+                logger.info(
+                    "[Debug] Soft rollback req=%s (was NOT_SCHEDULED on this"
+                    " rank, num_computed=%d)",
+                    req_id[:8],
+                    self.active_cp_requests[req_id].num_computed_tokens,
+                )
 
             # Remove from prev_step_scheduled_req_ids so that next step
             # treats this request as freshly resumed rather than continuing
